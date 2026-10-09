@@ -90,3 +90,7 @@ Files written by any app land in a shared virtual file system (`lib/vfs.ts`, per
 - The screensaver can play your own aerial video: `localStorage.setItem('opos:screensaver-video', '<url>')`.
 - `window.__opos` exposes the store for automation and debugging (e.g. `__opos.getState().setModeLock('tv')`).
 - Some sites refuse to be framed; in the browser preview they show a notice with an “Open” link. In Electron every app runs in a real `<webview>`.
+
+## Login screen (SDDM greeter)
+
+`greeter/opos-greeter` is a matching Qt 6 SDDM theme. It has the same convergence model as the shell: TV D-pad navigation, touch with an on-screen keyboard, and desktop mouse and keyboard. It also includes an optional **OPOS Shell** login session. Install it with `sudo ./scripts/install-greeter.sh`, or preview it with `./scripts/install-greeter.sh --test`. See [greeter/README.md](greeter/README.md).

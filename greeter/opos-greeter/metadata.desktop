@@ -1,0 +1,16 @@
+[SddmGreeterTheme]
+Name=OPOS Greeter
+Description=Convergence login screen for OPOS: cinematic clock, acrylic glass card, TV remote / touch / desktop input
+Author=OPOS Project
+Copyright=(c) OPOS Project
+License=MIT
+Type=sddm-theme
+Version=1.0.0
+Website=https://github.com/q123qrc-source/opos
+Screenshot=preview.png
+MainScript=Main.qml
+ConfigFile=theme.conf
+TranslationsDirectory=translations
+Theme-Id=opos-greeter
+Theme-API=2.0
+QtVersion=6

@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=OPOS Shell
+Comment=Convergence shell for TV, mobile and desktop
+Exec=/usr/local/bin/opos-session
+TryExec=/usr/local/bin/opos-session
+Type=Application
+DesktopNames=OPOS
+Keywords=opos;kiosk;tv;convergence;
