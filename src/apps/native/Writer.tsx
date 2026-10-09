@@ -1,8 +1,10 @@
-/** Office Writer — rich-text word processor with a ribbon toolbar, saving .doc files to the VFS. */
+/** Office Writer — rich-text word processor with a ribbon toolbar, saving .doc (HTML) files through fsapi (real FS in Electron, VFS in the browser). */
 import { useEffect, useRef, useState } from 'react';
-import { Bold, Italic, Underline, Strikethrough, AlignLeft, AlignCenter, AlignRight, AlignJustify, List, ListOrdered, Heading1, Heading2, Quote, Undo2, Redo2, Save, FileDown, Printer, Link2, Highlighter, Eraser, FilePlus } from 'lucide-react';
+import { Bold, Italic, Underline, Strikethrough, AlignLeft, AlignCenter, AlignRight, AlignJustify, List, ListOrdered, Heading1, Heading2, Quote, Undo2, Redo2, Save, FileDown, Printer, Link2, Highlighter, Eraser, FilePlus, FolderOpen } from 'lucide-react';
 import type { AppProps } from '../../types';
-import { HOME, basename, useFs } from '../../lib/vfs';
+import { fsapi, basename, dirname, pathJoin, uniquePath } from '../../lib/fsapi';
+import { extname } from '../../lib/vfs';
+import { ErrorBanner, FileDialog, errorText, useHome } from './shared/FileDialog';
 import { useOS } from '../../store/useOS';
 import { cx } from '../../lib/hooks';
 
@@ -12,29 +14,64 @@ const FONTS = ['Inter', 'Georgia', 'Times New Roman', 'Arial', 'Courier New', 'V
 const SIZES = [{ label: '10', v: '2' }, { label: '12', v: '3' }, { label: '14', v: '4' }, { label: '18', v: '5' }, { label: '24', v: '6' }, { label: '32', v: '7' }];
 
 const exec = (cmd: string, value?: string) => document.execCommand(cmd, false, value);
+const DOC_EXT = ['doc', 'html', 'htm', 'txt'];
+const escapeHtml = (t: string) => t.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+/** .txt files are shown as paragraphs and saved back as plain text; everything else keeps the HTML document format. */
+const isPlain = (p: string) => extname(p) === 'txt';
+const fromText = (t: string) => t.split('\n').map((l) => `<p>${escapeHtml(l) || '<br>'}</p>`).join('');
+const stem = (p: string) => basename(p).replace(/\.(doc|html?|txt)$/i, '');
 
 export default function Writer({ params, pid }: AppProps) {
   const editor = useRef<HTMLDivElement>(null);
-  const [path, setPath] = useState<string>((params?.path as string) ?? `${HOME}/Documents/Quarterly Report.doc`);
+  const home = useHome();
+  const [path, setPath] = useState<string | null>(null);
+  const [nameDraft, setNameDraft] = useState('');
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [dialog, setDialog] = useState<'open' | 'save' | 'export' | null>(null);
   const [words, setWords] = useState(0);
   const [dirty, setDirty] = useState(false);
   const [state, setState] = useState<Record<string, boolean>>({});
   const [zoom, setZoom] = useState(100);
-  const write = useFs((s) => s.write);
   const notify = useOS((s) => s.notify);
   const setTitle = useOS((s) => s.setTitle);
 
-  useEffect(() => {
-    const existing = useFs.getState().nodes[path]?.content;
-    if (editor.current) editor.current.innerHTML = existing ?? DEFAULT_DOC;
-    count();
-    setDirty(false);
-    setTitle(pid, `${basename(path)} — Office Writer`);
-  }, [path]); // eslint-disable-line react-hooks/exhaustive-deps
+  const docsDir = home ? `${home}/Documents` : '/';
+
+  /** Load a document from disk into the editor. With a fallback, a missing file shows that content instead. */
+  const load = async (p: string, fallback?: string) => {
+    setLoading(true);
+    try {
+      let html: string;
+      if (fallback !== undefined && !(await fsapi.exists(p))) html = fallback;
+      else {
+        const raw = await fsapi.readText(p);
+        html = isPlain(p) ? fromText(raw) : raw;
+      }
+      if (editor.current) editor.current.innerHTML = html;
+      setPath(p);
+      setDirty(false);
+      count();
+    } catch (e) {
+      setError(`Could not open ${basename(p)}: ${errorText(e)}`);
+    } finally {
+      setLoading(false);
+    }
+  };
 
   useEffect(() => {
-    if (params?.path) setPath(params.path as string);
-  }, [params?.path]);
+    if (!home) return;
+    const p = params?.path as string | undefined;
+    if (p) load(p);
+    else load(`${home}/Documents/Quarterly Report.doc`, DEFAULT_DOC);
+  }, [home, params?.path]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    if (path) setNameDraft(stem(path));
+    setTitle(pid, `${dirty ? '● ' : ''}${path ? basename(path) : 'Untitled'} — Office Writer`);
+  }, [path, dirty]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const serialize = (p: string) => (isPlain(p) ? editor.current?.innerText ?? '' : editor.current?.innerHTML ?? '');
 
   const count = () => {
     const text = editor.current?.innerText ?? '';
@@ -56,19 +93,53 @@ export default function Writer({ params, pid }: AppProps) {
     });
   };
 
-  const save = () => {
-    write(path, editor.current?.innerHTML ?? '');
-    setDirty(false);
-    notify('Document saved', basename(path), 'writer');
+  const saveTo = async (target: string) => {
+    try {
+      await fsapi.writeText(target, serialize(target));
+      setPath(target);
+      setDirty(false);
+      notify('Document saved', basename(target), 'writer');
+    } catch (e) {
+      setError(`Could not save ${basename(target)}: ${errorText(e)}`);
+    }
+  };
+  const save = () => (path ? saveTo(path) : setDialog('save'));
+
+  const exportHtml = async (target: string) => {
+    const html = `<!doctype html><meta charset="utf-8"><title>${escapeHtml(stem(target))}</title><body style="font-family:Georgia;max-width:720px;margin:40px auto">${editor.current?.innerHTML ?? ''}</body>`;
+    try {
+      await fsapi.writeText(target, html);
+      notify('Exported', basename(target), 'writer');
+    } catch (e) {
+      setError(`Could not export ${basename(target)}: ${errorText(e)}`);
+    }
   };
 
-  const exportHtml = () => {
-    const blob = new Blob([`<!doctype html><meta charset="utf-8"><title>${basename(path)}</title><body style="font-family:Georgia;max-width:720px;margin:40px auto">${editor.current?.innerHTML ?? ''}</body>`], { type: 'text/html' });
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob);
-    a.download = basename(path).replace(/\.doc$/, '') + '.html';
-    a.click();
-    URL.revokeObjectURL(a.href);
+  const newDoc = async () => {
+    if (dirty && !window.confirm('Discard unsaved changes?')) return;
+    try {
+      const p = await uniquePath(docsDir, 'Untitled', '.doc');
+      await fsapi.writeText(p, '<p></p>');
+      await load(p);
+    } catch (e) {
+      setError(`Could not create document: ${errorText(e)}`);
+    }
+  };
+
+  /** Rename the current file (or just retarget an unsaved one) when the title field is committed. */
+  const commitName = async () => {
+    if (!path) return;
+    const name = nameDraft.replace(/[\\/]/g, '').trim() || 'Untitled';
+    const next = pathJoin(dirname(path), `${name}.${extname(path) || 'doc'}`);
+    if (next === path) return setNameDraft(stem(path));
+    try {
+      if (await fsapi.exists(next)) throw new Error(`${basename(next)} already exists`);
+      if (await fsapi.exists(path)) await fsapi.rename(path, next);
+      setPath(next);
+    } catch (e) {
+      setError(`Could not rename: ${errorText(e)}`);
+      setNameDraft(stem(path));
+    }
   };
 
   const cmd = (c: string, v?: string) => () => {
@@ -86,29 +157,36 @@ export default function Writer({ params, pid }: AppProps) {
   const Sep = () => <span className="mx-1 h-6 w-px bg-white/10" />;
 
   return (
-    <div className="flex h-full flex-col bg-[#e9ebef]">
+    <div className="relative flex h-full flex-col bg-[#e9ebef]">
       {/* Title / file bar */}
       <div className="flex items-center gap-3 bg-[#1d4ed8] px-4 py-1.5 text-white">
         <span className="text-[13px] font-semibold">Writer</span>
         <input
-          value={basename(path).replace(/\.doc$/, '')}
-          onChange={(e) => {
-            const name = e.target.value.replace(/[\\/]/g, '') || 'Untitled';
-            const next = `${HOME}/Documents/${name}.doc`;
-            useFs.getState().rename(path, next);
-            setPath(next);
-          }}
+          value={nameDraft}
+          onChange={(e) => setNameDraft(e.target.value)}
+          onBlur={commitName}
+          onKeyDown={(e) => e.key === 'Enter' && e.currentTarget.blur()}
+          title={path ?? ''}
+          aria-label="Document name"
           className="w-64 rounded bg-white/10 px-2 py-0.5 text-[13px] outline-none focus:bg-white/20"
         />
-        <span className="text-[11px] text-white/70">{dirty ? 'Unsaved changes' : 'Saved to ~/Documents'}</span>
+        <span className="truncate text-[11px] text-white/70">
+          {loading ? 'Loading…' : dirty ? 'Unsaved changes' : path ? `Saved to ${home && path.startsWith(home + '/') ? '~' + dirname(path).slice(home.length) : dirname(path)}` : ''}
+        </span>
         <div className="ml-auto flex gap-1">
-          <button onClick={() => { const p = `${HOME}/Documents/Untitled ${new Date().toLocaleDateString().replace(/\//g, '-')} ${Date.now() % 1000}.doc`; write(p, '<p></p>'); setPath(p); }} className="flex items-center gap-1 rounded px-2 py-1 text-[12px] hover:bg-white/15">
+          <button onClick={newDoc} className="flex items-center gap-1 rounded px-2 py-1 text-[12px] hover:bg-white/15">
             <FilePlus size={14} /> New
+          </button>
+          <button onClick={() => setDialog('open')} className="flex items-center gap-1 rounded px-2 py-1 text-[12px] hover:bg-white/15">
+            <FolderOpen size={14} /> Open
           </button>
           <button onClick={save} className="flex items-center gap-1 rounded px-2 py-1 text-[12px] hover:bg-white/15">
             <Save size={14} /> Save
           </button>
-          <button onClick={exportHtml} className="flex items-center gap-1 rounded px-2 py-1 text-[12px] hover:bg-white/15">
+          <button onClick={() => setDialog('save')} className="flex items-center gap-1 rounded px-2 py-1 text-[12px] hover:bg-white/15">
+            Save as…
+          </button>
+          <button onClick={() => setDialog('export')} className="flex items-center gap-1 rounded px-2 py-1 text-[12px] hover:bg-white/15">
             <FileDown size={14} /> Export
           </button>
           <button onClick={() => window.print()} className="flex items-center gap-1 rounded px-2 py-1 text-[12px] hover:bg-white/15">
@@ -116,6 +194,8 @@ export default function Writer({ params, pid }: AppProps) {
           </button>
         </div>
       </div>
+
+      <ErrorBanner error={error} onClose={() => setError(null)} />
 
       {/* Ribbon */}
       <div className="flex flex-wrap items-center gap-0.5 border-b border-black/20 bg-[#1b1e2a] px-3 py-1.5">
@@ -183,9 +263,13 @@ export default function Writer({ params, pid }: AppProps) {
           onKeyUp={refreshState}
           onMouseUp={refreshState}
           onKeyDown={(e) => {
-            if ((e.ctrlKey || e.metaKey) && e.key === 's') {
+            if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') {
               e.preventDefault();
-              save();
+              if (e.shiftKey) setDialog('save');
+              else save();
+            } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'o') {
+              e.preventDefault();
+              setDialog('open');
             }
           }}
           className="doc-content selectable mx-auto min-h-[1056px] w-[816px] max-w-[calc(100%-2rem)] origin-top bg-white px-[72px] py-[72px] text-[15px] leading-relaxed text-slate-800 shadow-[0_2px_20px_rgba(0,0,0,.15)] outline-none"
@@ -208,6 +292,25 @@ export default function Writer({ params, pid }: AppProps) {
           </button>
         </div>
       </div>
+      {dialog && (
+        <FileDialog
+          mode={dialog === 'open' ? 'open' : 'save'}
+          title={dialog === 'open' ? 'Open document' : dialog === 'export' ? 'Export as HTML' : 'Save document as'}
+          initialDir={path ? dirname(path) : docsDir}
+          accept={dialog === 'open' ? DOC_EXT : undefined}
+          defaultName={dialog === 'open' ? '' : `${path ? stem(path) : 'Untitled'}.${dialog === 'export' ? 'html' : path ? extname(path) || 'doc' : 'doc'}`}
+          onCancel={() => setDialog(null)}
+          onConfirm={(p) => {
+            const which = dialog;
+            setDialog(null);
+            if (which === 'open') {
+              if (dirty && !window.confirm('Discard unsaved changes?')) return;
+              load(p);
+            } else if (which === 'export') exportHtml(p);
+            else saveTo(p);
+          }}
+        />
+      )}
     </div>
   );
 }

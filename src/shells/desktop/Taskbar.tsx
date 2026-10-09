@@ -3,7 +3,7 @@ import { Search, Wifi, WifiOff, Volume2, VolumeX, BatteryCharging, Battery, Minu
 import { useOS, TASKBAR_HEIGHT } from '../../store/useOS';
 import { bridge, isElectron, isSession } from '../../lib/bridge';
 import { useWeather } from '../../lib/weather';
-import { useSystem } from '../../lib/system';
+import { hasRealOs, useSystem } from '../../lib/system';
 import { cx, useBattery, useClock, useOnline, useTimeFormat } from '../../lib/hooks';
 import { activateGroup, closeWindow, findLaunchable, focusWindow, launch, LaunchableIcon, NativeIcon, useRunningGroups } from '../../session/launcher';
 
@@ -39,7 +39,7 @@ export function useTrayStatus() {
       : { level: webBattery.level, charging: webBattery.charging, present: !isElectron },
     network: net.available
       ? { online: !!net.online, kind: net.primaryType === 'wired' ? 'wired' : net.wifi || net.primaryType === 'wifi' ? 'wifi' : net.online ? 'wired' : 'offline', label: net.wifi?.ssid ?? net.primaryName ?? '' }
-      : { online: webOnline, kind: webOnline ? 'wifi' : 'offline', label: '' },
+      : { online: webOnline, kind: webOnline ? (hasRealOs ? 'wired' : 'wifi') : 'offline', label: '' },
     volume: vol.available ? { level: vol.level, muted: vol.muted } : { level: settingsVolume, muted: settingsVolume === 0 },
   };
 }

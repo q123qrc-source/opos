@@ -94,6 +94,7 @@ function serialize(w) {
 }
 
 function isMaximized(w) {
+    if (w.__oposMax) return true;
     var a = workspace.clientArea(KWin.MaximizeArea, w);
     var g = geom(w);
     return g.width >= a.width - 2 && g.height >= a.height - 2;
@@ -161,6 +162,26 @@ function layoutWindow(w) {
     setGeom(w, area.x, area.y, area.w, area.h);
 }
 
+/**
+ * Desktop: KWin doesn't know about the OPOS taskbar (Electron can't reserve a screen edge),
+ * so keep new and maximized windows inside the work area the shell reports.
+ */
+function fitDesktop(w) {
+    var a = state.appArea;
+    if (state.mode !== "desktop" || !a || !isAppWindow(w) || w.fullScreen) return;
+    var g = geom(w);
+    var h = Math.min(g.height, a.h), y = g.y;
+    if (y < a.y) y = a.y;
+    if (y + h > a.y + a.h) y = a.y + a.h - h;
+    if (h !== g.height || y !== g.y) setGeom(w, g.x, y, g.width, h);
+}
+function onMaximized(w, maximized) {
+    if (state.mode !== "desktop" || !isAppWindow(w)) return;
+    w.__oposMax = maximized;
+    var a = state.appArea;
+    if (maximized && a) setGeom(w, a.x, a.y, a.w, a.h);
+}
+
 /** Mobile/TV: keep app windows pinned to the app area if a client or decoration change moved them. */
 function enforceArea(w) {
     if (state.mode === "desktop" || !isAppWindow(w) || w.dialog || w.transient || w.fullScreen) return;
@@ -215,7 +236,8 @@ function run(c) {
         break;
     case "toggleMaximize":
         if (w && state.mode === "desktop") {
-            if (isMaximized(w)) w.setMaximize(false, false); else w.setMaximize(true, true);
+            if (isMaximized(w)) { w.__oposMax = false; w.setMaximize(false, false); }
+            else { w.setMaximize(true, true); onMaximized(w, true); }
         }
         break;
     case "fullscreen":
@@ -259,18 +281,27 @@ function watch(w) {
     connect(w.captionChanged, function () { if (isShell(w)) applySurface(w); update(); });
     connect(w.minimizedChanged, update);
     connect(w.fullScreenChanged, update);
+    // KWin 6: per-window signal; KWin 5 uses workspace.clientMaximizeSet (connected below).
+    connect(w.maximizedChanged, function () {
+        var a = workspace.clientArea(KWin.MaximizeArea, w), g = geom(w);
+        onMaximized(w, g.width >= a.width - 2 && g.height >= a.height - 2);
+    });
     connect(w.frameGeometryChanged, function () {
         enforceArea(w);
+        // Wayland clients settle their first size after being mapped: re-fit shortly after appearing.
+        if (Date.now() - (w.__oposAdded || 0) < 2000 && !w.move && !w.resize) fitDesktop(w);
         // Throttle geometry floods while dragging.
         var now = Date.now();
         if (now - (w.__oposLastGeom || 0) > 250) { w.__oposLastGeom = now; update(); }
     });
 }
 
+connect(workspace.clientMaximizeSet, function (w, h, v) { onMaximized(w, !!(h && v)); });
 connect(workspace.windowAdded || workspace.clientAdded, function (w) {
     watch(w);
     applySurface(w);
-    if (state.mode !== "desktop") layoutWindow(w);
+    w.__oposAdded = Date.now();
+    if (state.mode !== "desktop") layoutWindow(w); else fitDesktop(w);
     sendList();
     poll(); // re-arm the long poll if OPOS restarted
 });

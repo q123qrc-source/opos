@@ -230,7 +230,9 @@ class SessionManager {
     const area =
       mode === 'mobile'
         ? { x: s.x, y: s.y + MOBILE_STATUS_H, w: s.w, h: s.h - MOBILE_STATUS_H - MOBILE_NAV_H }
-        : { x: s.x, y: s.y, w: s.w, h: s.h };
+        : mode === 'desktop'
+          ? { x: s.x, y: s.y, w: s.w, h: s.h - TASKBAR_H } // work area above the taskbar
+          : { x: s.x, y: s.y, w: s.w, h: s.h };
     this.kwin.command('mode', { mode, area });
   }
 

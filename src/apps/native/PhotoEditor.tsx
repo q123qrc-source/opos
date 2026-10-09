@@ -1,8 +1,9 @@
-/** Photo Editor — canvas painting (brush, eraser, shapes, fill, text), filters, undo/redo, import/export. */
+/** Photo Editor — canvas painting (brush, eraser, shapes, fill, text), filters, undo/redo; opens/saves images through fsapi. */
 import { useEffect, useRef, useState } from 'react';
-import { Brush, Eraser, Square, Circle, Minus, PaintBucket, Type, Undo2, Redo2, Trash2, Download, Upload, Save, Pipette } from 'lucide-react';
+import { Brush, Eraser, Square, Circle, Minus, PaintBucket, Type, Undo2, Redo2, Trash2, Download, Upload, Save, Pipette, FolderOpen } from 'lucide-react';
 import type { AppProps } from '../../types';
-import { HOME, basename, useFs } from '../../lib/vfs';
+import { fsapi, basename, dirname, pathJoin, uniquePath } from '../../lib/fsapi';
+import { ErrorBanner, FileDialog, errorText, useHome } from './shared/FileDialog';
 import { useOS } from '../../store/useOS';
 import { cx } from '../../lib/hooks';
 
@@ -17,10 +18,12 @@ const FILTERS = [
   { label: 'Contrast', f: 'contrast(1.4)' },
   { label: 'Saturate', f: 'saturate(1.8)' },
 ];
+const IMAGE_EXT = ['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'svg'];
+const pngName = (n: string) => (n.trim() || 'Untitled').replace(/[\\/]/g, '').replace(/\.(png|jpe?g|gif|webp|bmp|svg)$/i, '') + '.png';
 const W = 1200;
 const H = 800;
 
-export default function PhotoEditor({ params }: AppProps) {
+export default function PhotoEditor({ params, pid }: AppProps) {
   const canvas = useRef<HTMLCanvasElement>(null);
   const overlay = useRef<HTMLCanvasElement>(null);
   const [tool, setTool] = useState<Tool>('brush');
@@ -31,7 +34,21 @@ export default function PhotoEditor({ params }: AppProps) {
   const redo = useRef<ImageData[]>([]);
   const [, force] = useState(0);
   const [name, setName] = useState('Untitled.png');
+  /** Where the image lives on disk: the PNG last saved, or the file it was opened from. */
+  const [path, setPath] = useState<string | null>(null);
+  const [savedPath, setSavedPath] = useState<string | null>(null);
+  const [dirty, setDirty] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [dialog, setDialog] = useState<'open' | 'save' | null>(null);
+  const home = useHome();
   const notify = useOS((s) => s.notify);
+  const setTitle = useOS((s) => s.setTitle);
+  const pictures = home ? `${home}/Pictures` : '/';
+
+  useEffect(() => {
+    setTitle(pid, `${dirty ? '● ' : ''}${name} — Photo Editor`);
+  }, [name, dirty]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const ctx = () => canvas.current!.getContext('2d', { willReadFrequently: true })!;
 
@@ -39,11 +56,13 @@ export default function PhotoEditor({ params }: AppProps) {
     undo.current.push(ctx().getImageData(0, 0, W, H));
     if (undo.current.length > 40) undo.current.shift();
     redo.current = [];
+    setDirty(true);
     force((n) => n + 1);
   };
 
-  const loadImage = (src: string) => {
+  const loadImage = (src: string, onDone?: () => void) => {
     const img = new Image();
+    img.onerror = () => setError('Could not decode the image');
     img.onload = () => {
       snapshot();
       const c = ctx();
@@ -51,6 +70,7 @@ export default function PhotoEditor({ params }: AppProps) {
       c.fillRect(0, 0, W, H);
       const s = Math.min(W / img.width, H / img.height);
       c.drawImage(img, (W - img.width * s) / 2, (H - img.height * s) / 2, img.width * s, img.height * s);
+      onDone?.();
     };
     img.src = src;
   };
@@ -82,14 +102,26 @@ export default function PhotoEditor({ params }: AppProps) {
     c.fillText('Paint something ✨', 70, 130);
   }, []);
 
+  const openPath = async (p: string) => {
+    setLoading(true);
+    try {
+      const data = await fsapi.readDataUrl(p);
+      loadImage(data, () => {
+        setName(pngName(basename(p)));
+        setPath(p);
+        setSavedPath(/\.png$/i.test(p) ? p : null);
+        setDirty(false);
+      });
+    } catch (e) {
+      setError(`Could not open ${basename(p)}: ${errorText(e)}`);
+    } finally {
+      setLoading(false);
+    }
+  };
+
   useEffect(() => {
     const p = params?.path as string | undefined;
-    if (!p) return;
-    const data = useFs.getState().nodes[p]?.content;
-    if (data?.startsWith('data:')) {
-      loadImage(data);
-      setName(basename(p));
-    }
+    if (p) openPath(p);
   }, [params?.path]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const toCanvas = (e: React.PointerEvent) => {
@@ -236,10 +268,27 @@ export default function PhotoEditor({ params }: AppProps) {
     force((n) => n + 1);
   };
 
-  const saveToVfs = () => {
-    const path = `${HOME}/Pictures/${name.endsWith('.png') ? name : name + '.png'}`;
-    useFs.getState().write(path, canvas.current!.toDataURL('image/png'));
-    notify('Image saved', path.replace(HOME, '~'), 'photo');
+  const writePng = async (target: string) => {
+    try {
+      await fsapi.writeDataUrl(target, canvas.current!.toDataURL('image/png'));
+      setPath(target);
+      setSavedPath(target);
+      setName(basename(target));
+      setDirty(false);
+      notify('Image saved', home && target.startsWith(home + '/') ? '~' + target.slice(home.length) : target, 'photo');
+    } catch (e) {
+      setError(`Could not save ${basename(target)}: ${errorText(e)}`);
+    }
+  };
+
+  /** Save: overwrite the PNG we already own; otherwise write <name>.png next to the source (or a fresh name in ~/Pictures). */
+  const save = async () => {
+    const file = pngName(name);
+    if (savedPath && basename(savedPath) === file) return writePng(savedPath);
+    const dir = path ? dirname(path) : pictures;
+    const target = savedPath || path ? pathJoin(dir, file) : await uniquePath(dir, file.replace(/\.png$/, ''), '.png');
+    if (target !== savedPath && (await fsapi.exists(target)) && !window.confirm(`${basename(target)} already exists. Replace it?`)) return;
+    writePng(target);
   };
 
   const tools: { id: Tool; icon: typeof Brush; label: string }[] = [
@@ -255,9 +304,17 @@ export default function PhotoEditor({ params }: AppProps) {
 
   return (
     <div
-      className="flex h-full flex-col bg-[#1a1b22] text-white"
+      className="relative flex h-full flex-col bg-[#1a1b22] text-white"
       tabIndex={-1}
       onKeyDown={(e) => {
+        if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') {
+          e.preventDefault();
+          return e.shiftKey ? setDialog('save') : void save();
+        }
+        if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'o') {
+          e.preventDefault();
+          return setDialog('open');
+        }
         if ((e.target as HTMLElement).tagName === 'INPUT') return;
         if ((e.ctrlKey || e.metaKey) && e.key === 'z') return e.shiftKey ? doRedo() : doUndo();
         if ((e.ctrlKey || e.metaKey) && e.key === 'y') return doRedo();
@@ -290,8 +347,11 @@ export default function PhotoEditor({ params }: AppProps) {
           ))}
         </select>
         <div className="ml-auto flex gap-1">
-          <label className="flex cursor-pointer items-center gap-1 rounded px-2 py-1 text-[12px] hover:bg-white/10">
-            <Upload size={14} /> Open
+          <button onClick={() => setDialog('open')} className="flex items-center gap-1 rounded px-2 py-1 text-[12px] hover:bg-white/10">
+            <FolderOpen size={14} /> {loading ? 'Opening…' : 'Open'}
+          </button>
+          <label className="flex cursor-pointer items-center gap-1 rounded px-2 py-1 text-[12px] hover:bg-white/10" title="Import an image from this device">
+            <Upload size={14} /> Import
             <input
               type="file"
               accept="image/*"
@@ -299,26 +359,23 @@ export default function PhotoEditor({ params }: AppProps) {
               onChange={(e) => {
                 const f = e.target.files?.[0];
                 if (!f) return;
-                setName(f.name.replace(/\.\w+$/, '.png'));
                 const reader = new FileReader();
-                reader.onload = () => loadImage(String(reader.result));
+                reader.onload = () =>
+                  loadImage(String(reader.result), () => {
+                    setName(pngName(f.name));
+                    setPath(null);
+                    setSavedPath(null);
+                  });
+                e.target.value = '';
                 reader.readAsDataURL(f);
               }}
             />
           </label>
-          <button onClick={saveToVfs} className="flex items-center gap-1 rounded px-2 py-1 text-[12px] hover:bg-white/10">
-            <Save size={14} /> Save
+          <button onClick={save} className="flex items-center gap-1 rounded px-2 py-1 text-[12px] hover:bg-white/10" title={`Save (Ctrl+S)${savedPath ? ` — ${savedPath}` : ''}`}>
+            <Save size={14} /> Save{dirty ? ' •' : ''}
           </button>
-          <button
-            onClick={() => {
-              const a = document.createElement('a');
-              a.href = canvas.current!.toDataURL('image/png');
-              a.download = name;
-              a.click();
-            }}
-            className="flex items-center gap-1 rounded px-2 py-1 text-[12px] hover:bg-white/10"
-          >
-            <Download size={14} /> Export
+          <button onClick={() => setDialog('save')} className="flex items-center gap-1 rounded px-2 py-1 text-[12px] hover:bg-white/10" title="Export as PNG (Ctrl+Shift+S)">
+            <Download size={14} /> Export PNG
           </button>
           <button
             onClick={() => {
@@ -333,6 +390,8 @@ export default function PhotoEditor({ params }: AppProps) {
           </button>
         </div>
       </div>
+
+      <ErrorBanner error={error} onClose={() => setError(null)} />
 
       <div className="flex min-h-0 flex-1">
         <div className="flex w-14 shrink-0 flex-col items-center gap-1 border-r border-white/5 bg-[#22232d] py-2">
@@ -357,6 +416,22 @@ export default function PhotoEditor({ params }: AppProps) {
           </div>
         </div>
       </div>
+      {dialog && (
+        <FileDialog
+          mode={dialog}
+          title={dialog === 'open' ? 'Open image' : 'Export as PNG'}
+          initialDir={path ? dirname(path) : pictures}
+          accept={dialog === 'open' ? IMAGE_EXT : ['png']}
+          defaultName={dialog === 'save' ? pngName(name) : ''}
+          onCancel={() => setDialog(null)}
+          onConfirm={(p) => {
+            const which = dialog;
+            setDialog(null);
+            if (which === 'open') openPath(p);
+            else writePng(/\.png$/i.test(p) ? p : `${p}.png`);
+          }}
+        />
+      )}
     </div>
   );
 }

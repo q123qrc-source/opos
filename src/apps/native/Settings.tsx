@@ -162,8 +162,22 @@ function useSettingsModel(): Section[] {
         ],
       };
 
+    // On a real system never show the simulated radios: say which service is missing instead.
+    const missingNetwork: Section = {
+      id: 'network',
+      title: 'Network',
+      icon: Wifi,
+      color: '#3b82f6',
+      summary: navigator.onLine ? 'Online' : 'Offline',
+      items: [
+        { kind: 'info', id: 'nm', label: 'Wi-Fi & connections', value: 'NetworkManager is not running' },
+        { kind: 'info', id: 'bt-missing', label: 'Bluetooth', value: 'No Bluetooth adapter' },
+        { kind: 'info', id: 'online', label: 'Internet', value: navigator.onLine ? 'Online' : 'Offline' },
+      ],
+    };
+
     return [
-      realNetwork ?? simulatedNetwork,
+      realNetwork ?? (hasRealOs ? missingNetwork : simulatedNetwork),
       ...(realBluetooth ? [realBluetooth] : []),
       {
         id: 'display',
