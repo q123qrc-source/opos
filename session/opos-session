@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# =============================================================================
+# OPOS desktop session — started by the display manager (SDDM, GDM, …) from
+# /usr/share/wayland-sessions/opos.desktop.
+#
+# Runs the KWin Wayland compositor (with Xwayland for X11 apps); KWin starts
+# opos-session-inner, which launches the OPOS shell. The session ends when the
+# shell exits (Log out), because KWin is started with --exit-with-session.
+# =============================================================================
+set -uo pipefail
+
+LIBEXEC="${OPOS_LIBEXEC:-/usr/libexec/opos}"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/opos"
+LOG="$STATE_DIR/session.log"
+mkdir -p "$STATE_DIR"
+# Keep one previous log around for post-mortems.
+[[ -f "$LOG" ]] && mv -f "$LOG" "$LOG.old"
+exec >>"$LOG" 2>&1
+echo "=== OPOS session $(date -Is) user=$USER ==="
+
+# A login session normally has a bus from systemd --user; bare greeters may not.
+if [[ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]] && [[ -z "${OPOS_IN_DBUS:-}" ]]; then
+  if [[ -S "${XDG_RUNTIME_DIR:-/run/user/$UID}/bus" ]]; then
+    export DBUS_SESSION_BUS_ADDRESS="unix:path=${XDG_RUNTIME_DIR:-/run/user/$UID}/bus"
+  elif command -v dbus-run-session >/dev/null 2>&1; then
+    export OPOS_IN_DBUS=1
+    exec dbus-run-session -- "$0" "$@"
+  fi
+fi
+
+export XDG_SESSION_TYPE=wayland
+export XDG_SESSION_DESKTOP=OPOS
+export XDG_CURRENT_DESKTOP=OPOS
+export DESKTOP_SESSION=opos
+# Toolkits: prefer native Wayland, keep X11 as the fallback through Xwayland.
+export QT_QPA_PLATFORM="wayland;xcb"
+export GDK_BACKEND="wayland,x11"
+export MOZ_ENABLE_WAYLAND=1
+export ELECTRON_OZONE_PLATFORM_HINT=auto
+export _JAVA_AWT_WM_NONREPARENTING=1
+# Qt apps pick up the Breeze/KDE look when the KDE platform theme is installed.
+if [[ -z "${QT_QPA_PLATFORMTHEME:-}" ]] && compgen -G "/usr/lib*/qt6/plugins/platformthemes/KDEPlasmaPlatformTheme6.so" >/dev/null; then
+  export QT_QPA_PLATFORMTHEME=kde
+fi
+
+# User overrides: plain KEY=value lines.
+if [[ -f "${XDG_CONFIG_HOME:-$HOME/.config}/opos/environment" ]]; then
+  set -a
+  # shellcheck disable=SC1090,SC1091
+  . "${XDG_CONFIG_HOME:-$HOME/.config}/opos/environment"
+  set +a
+fi
+
+command -v kwin_wayland >/dev/null 2>&1 || { echo "kwin_wayland is not installed: sudo dnf install kwin-wayland" >&2; exit 1; }
+
+exec kwin_wayland --xwayland --exit-with-session "$LIBEXEC/opos-session-inner"

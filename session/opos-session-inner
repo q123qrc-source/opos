@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+# Runs inside KWin (WAYLAND_DISPLAY / DISPLAY are set): wires the environment into
+# D-Bus/systemd activation, starts session helpers, then runs the OPOS shell.
+set -uo pipefail
+
+OPOS_DIR="${OPOS_DIR:-/opt/opos-shell}"
+VARS=(WAYLAND_DISPLAY DISPLAY XAUTHORITY XDG_CURRENT_DESKTOP XDG_SESSION_TYPE XDG_SESSION_DESKTOP DESKTOP_SESSION
+      QT_QPA_PLATFORM QT_QPA_PLATFORMTHEME GDK_BACKEND MOZ_ENABLE_WAYLAND ELECTRON_OZONE_PLATFORM_HINT)
+
+has_user_systemd() { systemctl --user show-environment >/dev/null 2>&1; }
+
+# 1. Make the display visible to D-Bus-activated services (portals, notifications…) and systemd units.
+if has_user_systemd; then
+  dbus-update-activation-environment --systemd "${VARS[@]}" 2>/dev/null || systemctl --user import-environment "${VARS[@]}"
+else
+  dbus-update-activation-environment "${VARS[@]}" 2>/dev/null || true
+fi
+
+# 2. Polkit authentication agent (needed for e.g. Wi-Fi passwords system-wide, mounting disks).
+for agent in \
+  /usr/libexec/kf6/polkit-kde-authentication-agent-1 \
+  /usr/libexec/polkit-kde-authentication-agent-1 \
+  /usr/lib/x86_64-linux-gnu/libexec/polkit-kde-authentication-agent-1 \
+  /usr/lib/polkit-kde-authentication-agent-1 \
+  /usr/libexec/polkit-gnome-authentication-agent-1 \
+  /usr/lib/polkit-gnome/polkit-gnome-authentication-agent-1 \
+  /usr/bin/lxqt-policykit-agent; do
+  if [[ -x "$agent" ]]; then "$agent" & break; fi
+done
+
+# 3. XDG autostart entries (~/.config/autostart, /etc/xdg/autostart) via systemd's generator.
+if has_user_systemd && systemctl --user cat xdg-desktop-autostart.target >/dev/null 2>&1; then
+  systemctl --user start xdg-desktop-autostart.target || true
+fi
+
+cleanup() {
+  if has_user_systemd; then
+    systemctl --user stop xdg-desktop-autostart.target 2>/dev/null || true
+    # Don't leak this session's display into the next login.
+    systemctl --user unset-environment WAYLAND_DISPLAY DISPLAY XAUTHORITY 2>/dev/null || true
+  fi
+  jobs -p | xargs -r kill 2>/dev/null || true
+}
+trap cleanup EXIT
+
+# 4. The shell: an electron-builder build, an AppImage, or a source checkout.
+if [[ -x "$OPOS_DIR/opos-shell" ]]; then
+  APP=("$OPOS_DIR/opos-shell")
+elif images=("$OPOS_DIR"/*.AppImage) && [[ -f "${images[0]}" ]]; then
+  APP=("${images[0]}")
+elif [[ -x "$OPOS_DIR/node_modules/.bin/electron" && -f "$OPOS_DIR/dist/index.html" ]]; then
+  APP=("$OPOS_DIR/node_modules/.bin/electron" "$OPOS_DIR")
+else
+  echo "OPOS Shell not found in $OPOS_DIR (set OPOS_DIR, or run scripts/install-session.sh)." >&2
+  exit 1
+fi
+
+# Extra shell flags for debugging, e.g. OPOS_SHELL_ARGS="--remote-debugging-port=9333".
+read -ra EXTRA <<<"${OPOS_SHELL_ARGS:-}"
+
+# Restart the shell if it crashes; a clean exit (Log out) ends the session.
+crashes=()
+while :; do
+  echo "[opos-session] starting ${APP[*]} --session"
+  "${APP[@]}" --session --ozone-platform=wayland "${EXTRA[@]}"
+  code=$?
+  [[ $code -eq 0 ]] && break
+  now=$(date +%s)
+  crashes=("${crashes[@]}" "$now")
+  recent=0
+  for t in "${crashes[@]}"; do (( now - t < 60 )) && recent=$((recent + 1)); done
+  echo "[opos-session] shell exited with code $code ($recent crash(es) in the last minute)"
+  if (( recent >= 3 )); then
+    echo "[opos-session] giving up: the shell keeps crashing" >&2
+    exit "$code"
+  fi
+  sleep 1
+done

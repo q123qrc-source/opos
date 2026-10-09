@@ -1,5 +1,8 @@
-/** Terminal — "opsh", a functional shell emulator over the OPOS VFS and process table. */
-import { useEffect, useRef, useState, type ReactNode } from 'react';
+/**
+ * Terminal — a real shell (xterm.js over node-pty) when running as an OPOS desktop session,
+ * otherwise "opsh", a functional shell emulator over the OPOS VFS and process table.
+ */
+import { lazy, Suspense, useEffect, useRef, useState, type ReactNode } from 'react';
 import type { AppProps } from '../../types';
 import { HOME, basename, dirname, fs, listDir, resolvePath, useFs } from '../../lib/vfs';
 import { useOS } from '../../store/useOS';
@@ -24,7 +27,35 @@ const COMMANDS = ['help', 'ls', 'cd', 'pwd', 'cat', 'echo', 'mkdir', 'touch', 'r
 
 const shortPath = (p: string) => (p.startsWith(HOME) ? '~' + p.slice(HOME.length) : p);
 
-export default function Terminal({ pid, params }: AppProps) {
+// xterm.js is only loaded when a real PTY backend is present.
+const RealTerminal = lazy(() => import('./terminal/RealTerminal'));
+
+let ptyAvailable: Promise<boolean> | null = null;
+const checkPty = () => (ptyAvailable ??= bridge.pty ? bridge.pty.available().catch(() => false) : Promise.resolve(false));
+
+export default function Terminal(props: AppProps) {
+  const [backend, setBackend] = useState<'checking' | 'pty' | 'opsh'>(bridge.pty ? 'checking' : 'opsh');
+
+  useEffect(() => {
+    if (backend !== 'checking') return;
+    let alive = true;
+    void checkPty().then((ok) => alive && setBackend(ok ? 'pty' : 'opsh'));
+    return () => {
+      alive = false;
+    };
+  }, [backend]);
+
+  if (backend === 'checking') return <div className="h-full bg-[#0a0c12]" />;
+  if (backend === 'pty' && bridge.pty)
+    return (
+      <Suspense fallback={<div className="h-full bg-[#0a0c12]" />}>
+        <RealTerminal pty={bridge.pty} pid={props.pid} cwd={typeof props.params?.cwd === 'string' ? props.params.cwd : undefined} />
+      </Suspense>
+    );
+  return <Opsh {...props} />;
+}
+
+function Opsh({ pid, params }: AppProps) {
   const [cwd, setCwd] = useState<string>((params?.cwd as string) ?? HOME);
   const [lines, setLines] = useState<Line[]>(() => banner());
   const [input, setInput] = useState('');

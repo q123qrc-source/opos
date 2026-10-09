@@ -12,7 +12,11 @@
     "build": "tsc --noEmit && vite build",
     "typecheck": "tsc --noEmit",
     "start": "electron .",
-    "dist": "npm run build && electron-builder"
+    "dist": "npm run build && electron-builder",
+    "dist:session": "npm run build && electron-builder --linux dir --publish never",
+    "session:nested": "npm run build && ./scripts/opos-nested.sh",
+    "rebuild:native": "electron-rebuild -f -w node-pty",
+    "postinstall": "electron-rebuild -f -w node-pty || echo \"[opos] node-pty rebuild failed: Terminal falls back to opsh\""
   },
   "build": {
     "appId": "org.opos.shell",
@@ -26,7 +30,8 @@
       "target": [
         "AppImage"
       ],
-      "category": "System"
+      "category": "System",
+      "executableName": "opos-shell"
     },
     "win": {
       "target": [
@@ -38,7 +43,13 @@
         "dmg"
       ],
       "category": "public.app-category.utilities"
-    }
+    },
+    "directories": {
+      "output": "release"
+    },
+    "asarUnpack": [
+      "electron/session/kwin/**"
+    ]
   },
   "dependencies": {
     "@codemirror/lang-css": "^6.3.1",

@@ -24,7 +24,7 @@ What the installer does:
 4. Writes `/etc/sddm.conf.d/zz-opos-greeter.conf` with:
    - `InputMethod=qtvirtualkeyboard`, which powers the on-screen keyboard.
    - `GreeterEnvironment=QML_XHR_ALLOW_FILE_READ=1`, which lets the theme read `/sys/class/power_supply` and `/proc/net/wireless` for the battery and Wi-Fi pills. Any existing `GreeterEnvironment` values are merged in.
-5. With `--with-session`, adds an **OPOS Shell** Wayland session to the session picker. It runs the Electron shell fullscreen in the [`cage`](https://github.com/cage-kiosk/cage) kiosk compositor. Set `OPOS_DIR` in `/usr/local/bin/opos-session` to point at your build; the default is `/opt/opos-shell`.
+5. With `--with-session`, registers the **OPOS** desktop session (KWin Wayland + the OPOS shell) in the session picker. Build and install the shell itself with `./scripts/install-session.sh` (see the main README).
 
 `sudo ./scripts/install-greeter.sh --uninstall` reverses all of this.
 
@@ -95,5 +95,5 @@ greeter/opos-greeter/
     OposButton.qml      shared button (hover, ripple, TV glow) + FocusGlow, Ripple, Icon, ToolTipBubble
     VirtualKeyboard.qml Qt Virtual Keyboard panel (loaded on demand)
   assets/icons/*.svg    line icons
-greeter/session/        OPOS Shell Wayland session (.desktop + cage launcher)
+../session/              OPOS desktop session (.desktop + KWin launcher), installed by scripts/install-session.sh
 ```

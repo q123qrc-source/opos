@@ -11,6 +11,8 @@ npm start          # run Electron against dist/
 npm run dist       # package with electron-builder
 ```
 
+OPOS also runs as a **real Linux desktop session**: pick “OPOS” at the login screen, and it manages your installed apps, terminal, files, Wi-Fi, sound and power. See [Desktop session](#desktop-session).
+
 ## Architecture
 
 ```
@@ -93,4 +95,36 @@ Files written by any app land in a shared virtual file system (`lib/vfs.ts`, per
 
 ## Login screen (SDDM greeter)
 
-`greeter/opos-greeter` is a matching Qt 6 SDDM theme. It has the same convergence model as the shell: TV D-pad navigation, touch with an on-screen keyboard, and desktop mouse and keyboard. It also includes an optional **OPOS Shell** login session. Install it with `sudo ./scripts/install-greeter.sh`, or preview it with `./scripts/install-greeter.sh --test`. See [greeter/README.md](greeter/README.md).
+`greeter/opos-greeter` is a matching Qt 6 SDDM theme. It has the same convergence model as the shell: TV D-pad navigation, touch with an on-screen keyboard, and desktop mouse and keyboard. With `--with-session` it also registers the OPOS desktop session. Install it with `sudo ./scripts/install-greeter.sh`, or preview it with `./scripts/install-greeter.sh --test`. See [greeter/README.md](greeter/README.md).
+
+## Desktop session
+
+The same shell runs as a full Wayland desktop session. KWin is the compositor and window manager, and OPOS draws everything else.
+
+```
+./scripts/install-session.sh --install-deps   # dnf deps, build, install to /opt/opos-shell, register the session
+./scripts/opos-nested.sh                      # try it in a window inside your current desktop (npm run build first)
+```
+
+At the login screen, pick **OPOS**. The chain is `/usr/bin/opos-session` → `kwin_wayland --xwayland` → `/usr/libexec/opos/opos-session-inner` → `opos-shell --session`. The inner script exports the display to D-Bus and systemd activation, starts a polkit agent and XDG autostart entries, and restarts the shell if it crashes. Log out ends the session. Logs are in `~/.local/state/opos/session.log`.
+
+**How it works**
+
+- **Window management.** `electron/session/kwin/opos-wm.js` is a KWin script, loaded over D-Bus. It talks to the shell through `org.opos.Shell` (`electron/session/kwin/bridge.cjs`).
+  - It reports the window list, focus, global shortcuts and tablet-mode changes.
+  - The shell sends commands back: activate, minimize, close, maximize, show desktop, and per-mode layout.
+  - Desktop mode keeps normal decorated windows. Mobile and TV make every app borderless and fill the app area, and restore their old geometry when you switch back.
+- **Shell surfaces.** The shell is several layer-like windows, each a React root (`src/session/Surfaces.tsx`): `desktop` (wallpaper and home, kept below), `panel` (taskbar or navigation bar), `topbar` (mobile status bar), `overlay` (start menu, quick settings, recents) and `toast`.
+  - Their shared state lives in the main process and is synced to every surface.
+  - Built-in OPOS apps open as ordinary windows.
+- **Apps.** `electron/session/apps.cjs` reads `.desktop` entries (the Desktop Entry and Icon Theme specs) and keeps watching for changes. It launches apps in their own `systemd-run --user --scope` and matches windows back to their entries for taskbar icons.
+- **System.** `electron/session/system.cjs` uses the standard services:
+  - logind for power, lock and brightness, and UPower for battery.
+  - NetworkManager for Wi-Fi scan and connect, and BlueZ for Bluetooth.
+  - PipeWire/WirePlumber (`wpctl`, with `pactl` as fallback) for volume, and MPRIS for media controls.
+  - An `org.freedesktop.Notifications` server, so other apps' notifications appear as OPOS toasts.
+- **Apps on real data.** Terminal is xterm.js on a real PTY (node-pty). Files, Code Editor, Notes, Writer and Photo Editor work on your home directory. Settings and System Monitor show live system data. In a plain browser, the same apps fall back to the virtual file system and simulated services.
+
+**Shortcuts:** Meta+Space (start), Meta+H (home), Meta+Esc (back), Meta+Tab (recents), Meta+L (lock), Meta+Shift+0/1/2/3 (auto/desktop/mobile/TV mode).
+
+**Developing:** `npm run session:nested` builds and runs the session nested. Set `OPOS_DEBUG=1` to log the KWin bridge traffic, and `OPOS_SHELL_ARGS="--remote-debugging-port=9333"` to inspect the surfaces with DevTools. Running from a source checkout requires node-pty to be rebuilt for Electron; `npm install` runs `npm run rebuild:native` for this.

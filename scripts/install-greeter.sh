@@ -4,7 +4,7 @@
 #
 #   sudo ./scripts/install-greeter.sh                 install theme + set it as current
 #   sudo ./scripts/install-greeter.sh --install-deps  also dnf-install SDDM + Qt 6 modules
-#   sudo ./scripts/install-greeter.sh --with-session  also register an "OPOS Shell" session
+#   sudo ./scripts/install-greeter.sh --with-session  also register the "OPOS" desktop session
 #   sudo ./scripts/install-greeter.sh --enable-sddm   also make SDDM the display manager
 #        ./scripts/install-greeter.sh --test          preview in a window (no root, no install)
 #   sudo ./scripts/install-greeter.sh --uninstall     remove theme + config
@@ -19,8 +19,8 @@ DEST_DIR="${THEMES_DIR}/${THEME_NAME}"
 CONF_DIR="/etc/sddm.conf.d"
 THEME_CONF="${CONF_DIR}/theme.conf"
 EXTRA_CONF="${CONF_DIR}/zz-opos-greeter.conf"   # read last: input method + greeter environment
-SESSION_FILE="/usr/share/wayland-sessions/opos-shell.desktop"
-SESSION_BIN="/usr/local/bin/opos-session"
+SESSION_FILE="/usr/share/wayland-sessions/opos.desktop"
+SESSION_BIN="/usr/bin/opos-session"
 
 DNF_PACKAGES=(sddm qt6-qtdeclarative qt6-qtsvg qt6-qtvirtualkeyboard qt6-qtmultimedia rsms-inter-fonts)
 GREETER_ENV="QML_XHR_ALLOW_FILE_READ=1"
@@ -242,14 +242,17 @@ ok "$EXTRA_CONF → InputMethod=qtvirtualkeyboard, GreeterEnvironment=${merged_e
 
 # ----------------------------------------------------------------------------- 4. optional session
 if [[ $WITH_SESSION -eq 1 ]]; then
-  step "Registering the 'OPOS Shell' Wayland session"
-  install -m 0755 "$REPO_ROOT/greeter/session/opos-session" "$SESSION_BIN"
-  install -d -m 0755 "$(dirname "$SESSION_FILE")"
-  install -m 0644 "$REPO_ROOT/greeter/session/opos-shell.desktop" "$SESSION_FILE"
-  command -v restorecon >/dev/null 2>&1 && restorecon "$SESSION_BIN" "$SESSION_FILE" || true
-  ok "$SESSION_FILE (launches $SESSION_BIN)"
-  command -v cage >/dev/null 2>&1 || warn "The session uses the 'cage' kiosk compositor: sudo dnf install cage"
-  info "Point OPOS_DIR in $SESSION_BIN at your OPOS Shell build (default /opt/opos-shell)."
+  step "Registering the 'OPOS' desktop session"
+  if [[ -x "$REPO_ROOT/release/linux-unpacked/opos-shell" ]]; then
+    bash "$REPO_ROOT/scripts/install-session.sh" --skip-build
+  else
+    install -D -m 0755 "$REPO_ROOT/session/opos-session" "$SESSION_BIN"
+    install -D -m 0755 "$REPO_ROOT/session/opos-session-inner" /usr/libexec/opos/opos-session-inner
+    install -D -m 0644 "$REPO_ROOT/session/opos.desktop" "$SESSION_FILE"
+    command -v restorecon >/dev/null 2>&1 && restorecon "$SESSION_BIN" "$SESSION_FILE" || true
+    ok "$SESSION_FILE (launches $SESSION_BIN)"
+    warn "No OPOS Shell build installed yet. As your normal user run: ./scripts/install-session.sh --install-deps"
+  fi
 fi
 
 # ----------------------------------------------------------------------------- 5. display manager

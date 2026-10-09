@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=OPOS
+Comment=OPOS convergence desktop — TV, mobile and desktop modes on KWin Wayland
+Exec=/usr/bin/opos-session
+TryExec=/usr/bin/opos-session
+Type=Application
+DesktopNames=OPOS
+Keywords=opos;tv;mobile;convergence;wayland;

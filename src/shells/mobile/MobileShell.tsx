@@ -3,7 +3,7 @@
  * navigation (Back / Home / Recents), recents switcher and pull-down control center.
  */
 import { useMemo, useRef, useState, type PointerEvent as RPE } from 'react';
-import { ChevronLeft, Circle, Square, Wifi, WifiOff, Signal, Search, X, Play, Pause, SkipForward, Plane, BatteryCharging } from 'lucide-react';
+import { ChevronLeft, Circle, Square, Wifi, WifiOff, Search, X, Play, Pause, SkipForward, Plane, BatteryCharging } from 'lucide-react';
 import { useOS, selectForeground } from '../../store/useOS';
 import { bridge, isSession } from '../../lib/bridge';
 import { findLaunchable, focusWindow, closeWindow, launch, LaunchableIcon, searchLaunchables, useLaunchables, useRunningGroups, NativeIcon, type Launchable } from '../../session/launcher';
@@ -82,7 +82,7 @@ export function StatusBar({ dark }: { dark: boolean }) {
   const now = useClock(5000);
   const fmt = useTimeFormat();
   const tray = useTrayStatus();
-  const battery = { level: tray.battery.level, charging: tray.battery.charging };
+  const battery = tray.battery;
   const online = tray.network.online;
   const airplane = useOS((s) => s.settings.airplane);
   const setOverlay = useOS((s) => s.setOverlay);
@@ -101,13 +101,17 @@ export function StatusBar({ dark }: { dark: boolean }) {
     >
       <span>{fmt(now)}</span>
       <div className="flex items-center gap-1.5">
-        {airplane ? <Plane size={14} /> : <Signal size={14} />}
+        {airplane && <Plane size={14} />}
         {online ? <Wifi size={14} /> : <WifiOff size={14} className="opacity-50" />}
-        <span className="text-[12px]">{Math.round(battery.level * 100)}%</span>
-        <div className="relative flex h-[12px] w-[24px] items-center rounded-[4px] border border-white/70 p-[1.5px]">
-          <div className={cx('h-full rounded-[2px]', battery.level < 0.2 ? 'bg-red-400' : 'bg-white')} style={{ width: `${battery.level * 100}%` }} />
-          {battery.charging && <BatteryCharging size={10} className="absolute left-1/2 -translate-x-1/2 text-black" />}
-        </div>
+        {battery.present && (
+          <>
+            <span className="text-[12px]">{Math.round(battery.level * 100)}%</span>
+            <div className="relative flex h-[12px] w-[24px] items-center rounded-[4px] border border-white/70 p-[1.5px]">
+              <div className={cx('h-full rounded-[2px]', battery.level < 0.2 ? 'bg-red-400' : 'bg-white')} style={{ width: `${battery.level * 100}%` }} />
+              {battery.charging && <BatteryCharging size={10} className="absolute left-1/2 -translate-x-1/2 text-black" />}
+            </div>
+          </>
+        )}
       </div>
     </div>
   );
