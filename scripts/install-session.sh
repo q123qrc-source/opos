@@ -89,7 +89,8 @@ if [[ $SKIP_BUILD -eq 0 ]]; then
   command -v npm >/dev/null 2>&1 || die "npm not found (re-run with --install-deps, or install Node.js ≥ 20)."
   step "Building OPOS Shell"
   cd "$REPO_ROOT"
-  [[ -d node_modules ]] || npm ci
+  # Always sync: an older checkout's node_modules can lack newer deps (xterm, node-pty, dbus-next).
+  npm install --no-audit --no-fund
   npm run build
   # electron-builder rebuilds node-pty against Electron's ABI while packaging.
   npx electron-builder --linux dir --publish never
