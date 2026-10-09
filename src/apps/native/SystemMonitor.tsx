@@ -1,12 +1,13 @@
 /**
- * System Monitor — CPU / memory telemetry and the OPOS process table.
- * Real data from the Electron main process (os + app.getAppMetrics) when available; a simulated
- * model in the browser preview. One measure per chart (no dual axes), hover crosshair + tooltip.
+ * System Monitor — CPU / memory telemetry and the process table.
+ * In an OPOS desktop session (bridge.os) it shows the real Linux process table (/proc) and CPU
+ * usage; in plain Electron it uses the main-process stats; in the browser preview a simulated
+ * model. One measure per chart (no dual axes), hover crosshair + tooltip.
  */
-import { useMemo, useRef, useState } from 'react';
-import { Cpu, MemoryStick, Activity, X, Layers, Clock } from 'lucide-react';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { Cpu, MemoryStick, Activity, X, Layers, Clock, Search, ArrowUp, ArrowDown } from 'lucide-react';
 import type { AppProps } from '../../types';
-import { bridge, isElectron, type SystemStats } from '../../lib/bridge';
+import { bridge, isElectron, type ProcInfo, type SystemStats } from '../../lib/bridge';
 import { useOS } from '../../store/useOS';
 import { getApp } from '../manifest';
 import { AppIcon } from '../../components/AppIcon';
@@ -42,23 +43,67 @@ function simulate(prev: Sample | undefined, procs: number): SystemStats {
   };
 }
 
+const realOs = bridge.os ?? null;
+
+/** Real sample: CPU from the OS service, memory/uptime/load from main-process stats when present. */
+async function sampleReal(prevStats: SystemStats | null, procs: ProcInfo[]): Promise<SystemStats> {
+  const [cpu, base, info] = await Promise.all([
+    realOs!.cpu().catch(() => null),
+    bridge.system.stats().catch(() => null),
+    prevStats ? Promise.resolve(null) : realOs!.info().catch(() => null),
+  ]);
+  const memTotal = base?.memTotal ?? info?.memTotal ?? prevStats?.memTotal ?? 0;
+  const rssSum = procs.reduce((a, p) => a + p.rss, 0);
+  return {
+    cpu: cpu?.total ?? base?.cpu ?? 0,
+    perCore: cpu?.perCore ?? base?.perCore ?? [],
+    cpuModel: base?.cpuModel ?? info?.cpu ?? prevStats?.cpuModel ?? '',
+    memTotal,
+    memFree: base ? base.memFree : Math.max(0, memTotal - rssSum),
+    uptime: base?.uptime ?? info?.uptime ?? (prevStats ? prevStats.uptime + 1 : 0),
+    loadavg: base?.loadavg ?? prevStats?.loadavg ?? [],
+    platform: base?.platform ?? 'linux',
+    hostname: base?.hostname ?? info?.hostname ?? prevStats?.hostname ?? '',
+    metrics: base?.metrics ?? [],
+  };
+}
+
+type Tab = 'performance' | 'processes' | 'apps';
+
 export default function SystemMonitor({ mode }: AppProps) {
   const processes = useOS((s) => s.processes);
   const close = useOS((s) => s.close);
-  const [tab, setTab] = useState<'performance' | 'processes'>('performance');
+  const [tab, setTab] = useState<Tab>('performance');
   const [samples, setSamples] = useState<Sample[]>([]);
   const [stats, setStats] = useState<SystemStats | null>(null);
+  const [procs, setProcs] = useState<ProcInfo[]>([]);
+  const [procError, setProcError] = useState<string | null>(null);
+
+  // Real process table, polled every 2 s while visible (also feeds the memory fallback).
+  const pollProcs = async () => {
+    if (!realOs) return;
+    try {
+      setProcs(await realOs.processes());
+      setProcError(null);
+    } catch (e) {
+      setProcError(e instanceof Error ? e.message : String(e));
+    }
+  };
+  useEffect(() => {
+    void pollProcs();
+  }, []);
+  useInterval(pollProcs, realOs && tab === 'processes' ? 2000 : null);
 
   useInterval(async () => {
     let s: SystemStats;
     try {
-      s = isElectron ? await bridge.system.stats() : simulate(samples[samples.length - 1], processes.length);
+      s = realOs ? await sampleReal(stats, procs) : isElectron ? await bridge.system.stats() : simulate(samples[samples.length - 1], processes.length);
     } catch {
       s = simulate(samples[samples.length - 1], processes.length);
     }
     setStats(s);
     const memUsed = s.memTotal - s.memFree;
-    setSamples((list) => [...list, { t: Date.now(), cpu: s.cpu, mem: (memUsed / s.memTotal) * 100, memUsed }].slice(-HISTORY));
+    setSamples((list) => [...list, { t: Date.now(), cpu: s.cpu, mem: s.memTotal ? (memUsed / s.memTotal) * 100 : 0, memUsed }].slice(-HISTORY));
   }, 1000);
 
   const last = samples[samples.length - 1];
@@ -67,12 +112,12 @@ export default function SystemMonitor({ mode }: AppProps) {
   return (
     <div className="flex h-full flex-col bg-[#0d0f17] text-white">
       <div className="flex items-center gap-1 border-b border-white/5 px-3 py-2">
-        {(['performance', 'processes'] as const).map((t) => (
+        {(realOs ? (['performance', 'processes', 'apps'] as const) : (['performance', 'processes'] as const)).map((t) => (
           <button key={t} onClick={() => setTab(t)} className={cx('rounded-md px-3 py-1.5 text-[13px] capitalize', tab === t ? 'bg-white/10 text-white' : 'text-white/50 hover:bg-white/5')}>
-            {t}
+            {t === 'apps' ? 'OPOS apps' : t}
           </button>
         ))}
-        <span className="ml-auto text-[11px] text-white/35">{isElectron ? 'Live · Electron main process' : 'Simulated · browser preview'}</span>
+        <span className="ml-auto text-[11px] text-white/35">{realOs ? `Live · ${stats?.hostname || 'system'}` : isElectron ? 'Live · Electron main process' : 'Simulated · browser preview'}</span>
       </div>
 
       {tab === 'performance' ? (
@@ -80,14 +125,18 @@ export default function SystemMonitor({ mode }: AppProps) {
           <div className={cx('mb-4 grid gap-3', compact ? 'grid-cols-2' : 'grid-cols-4')}>
             <Tile icon={Cpu} label="CPU" value={last ? `${last.cpu.toFixed(0)}%` : '—'} sub={stats?.cpuModel ?? ''} />
             <Tile icon={MemoryStick} label="Memory" value={last ? `${last.mem.toFixed(0)}%` : '—'} sub={stats ? `${formatBytes(last?.memUsed ?? 0)} / ${formatBytes(stats.memTotal)}` : ''} />
-            <Tile icon={Layers} label="OPOS apps" value={String(processes.length)} sub={`${stats?.metrics.length ?? 0} Chromium processes`} />
-            <Tile icon={Clock} label="Uptime" value={stats ? `${(stats.uptime / 3600).toFixed(1)} h` : '—'} sub={stats ? `Load ${stats.loadavg.map((l) => l.toFixed(2)).join(' · ')}` : ''} />
+            {realOs ? (
+              <Tile icon={Layers} label="Processes" value={procs.length ? String(procs.length) : '—'} sub={`${processes.length} OPOS app${processes.length === 1 ? '' : 's'} open`} />
+            ) : (
+              <Tile icon={Layers} label="OPOS apps" value={String(processes.length)} sub={`${stats?.metrics.length ?? 0} Chromium processes`} />
+            )}
+            <Tile icon={Clock} label="Uptime" value={stats ? `${(stats.uptime / 3600).toFixed(1)} h` : '—'} sub={stats?.loadavg.length ? `Load ${stats.loadavg.map((l) => l.toFixed(2)).join(' · ')}` : ''} />
           </div>
           <div className={cx('grid gap-4', compact ? 'grid-cols-1' : 'grid-cols-2')}>
             <ChartCard title="CPU utilization" unit="%" color="#38bdf8" data={samples.map((s) => ({ t: s.t, v: s.cpu }))} />
             <ChartCard title="Memory in use" unit="%" color="#a78bfa" data={samples.map((s) => ({ t: s.t, v: s.mem }))} />
           </div>
-          {stats && (
+          {stats && stats.perCore.length > 0 && (
             <div className="mt-4 rounded-xl border border-white/5 bg-white/[.03] p-4">
               <div className="mb-3 text-[13px] font-medium text-white/80">Per-thread load</div>
               <div className="grid grid-cols-[repeat(auto-fill,minmax(64px,1fr))] gap-2">
@@ -105,6 +154,8 @@ export default function SystemMonitor({ mode }: AppProps) {
             </div>
           )}
         </div>
+      ) : tab === 'processes' && realOs ? (
+        <ProcessTable procs={procs} error={procError} memTotal={stats?.memTotal ?? 0} onKilled={() => void pollProcs()} />
       ) : (
         <div className="min-h-0 flex-1 overflow-y-auto">
           <table className="w-full text-left text-[13px]">
@@ -240,6 +291,143 @@ function ChartCard({ title, unit, color, data }: { title: string; unit: string; 
           <span>50</span>
           <span>0</span>
         </div>
+      </div>
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------ real process table */
+
+type SortKey = 'name' | 'pid' | 'cpu' | 'rss';
+
+function ProcessTable({ procs, error, memTotal, onKilled }: { procs: ProcInfo[]; error: string | null; memTotal: number; onKilled: () => void }) {
+  const [sort, setSort] = useState<{ key: SortKey; dir: 1 | -1 }>({ key: 'cpu', dir: -1 });
+  const [query, setQuery] = useState('');
+  const [onlyMine, setOnlyMine] = useState(false);
+  const [confirm, setConfirm] = useState<ProcInfo | null>(null);
+  const [killError, setKillError] = useState<string | null>(null);
+  const [killing, setKilling] = useState(false);
+
+  const rows = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    const list = procs.filter((p) => (!onlyMine || p.own) && (!q || p.name.toLowerCase().includes(q) || p.cmd.toLowerCase().includes(q) || String(p.pid).startsWith(q)));
+    const { key, dir } = sort;
+    return list.sort((a, b) => {
+      const r = key === 'name' ? a.name.localeCompare(b.name) : key === 'pid' ? a.pid - b.pid : key === 'cpu' ? a.cpu - b.cpu || a.rss - b.rss : a.rss - b.rss;
+      return r * dir || a.pid - b.pid;
+    });
+  }, [procs, query, onlyMine, sort]);
+
+  const toggleSort = (key: SortKey) => setSort((s) => (s.key === key ? { key, dir: s.dir === 1 ? -1 : 1 } : { key, dir: key === 'name' || key === 'pid' ? 1 : -1 }));
+
+  const kill = async (p: ProcInfo) => {
+    setKilling(true);
+    setKillError(null);
+    try {
+      await realOs!.kill(p.pid);
+      setConfirm(null);
+      setTimeout(onKilled, 400);
+    } catch (e) {
+      setKillError((e instanceof Error ? e.message : String(e)).replace(/^Error invoking remote method '[^']+':\s*(Error:\s*)?/, ''));
+    } finally {
+      setKilling(false);
+    }
+  };
+
+  const th = (k: SortKey, label: string, right?: boolean) => (
+    <th className={cx('px-3 py-2 font-medium', right && 'text-right')} aria-sort={sort.key === k ? (sort.dir === 1 ? 'ascending' : 'descending') : 'none'}>
+      <button onClick={() => toggleSort(k)} className={cx('inline-flex items-center gap-1 hover:text-white', sort.key === k && 'text-white/80')}>
+        {label}
+        {sort.key === k && (sort.dir === 1 ? <ArrowUp size={11} /> : <ArrowDown size={11} />)}
+      </button>
+    </th>
+  );
+
+  return (
+    <div className="flex min-h-0 flex-1 flex-col">
+      <div className="flex flex-wrap items-center gap-2 border-b border-white/5 px-3 py-2">
+        <div className="flex min-w-[160px] flex-1 items-center gap-2 rounded-md bg-white/[.06] px-2.5 py-1.5">
+          <Search size={13} className="text-white/40" />
+          <input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Search name, command or PID" className="w-full bg-transparent text-[13px] outline-none placeholder:text-white/35" />
+        </div>
+        <label className="flex items-center gap-1.5 text-[12px] text-white/60">
+          <input type="checkbox" checked={onlyMine} onChange={(e) => setOnlyMine(e.target.checked)} className="accent-[var(--os-accent,#38bdf8)]" />
+          My processes
+        </label>
+        <span className="text-[11px] tabular-nums text-white/35">
+          {rows.length} / {procs.length}
+        </span>
+      </div>
+      {confirm && (
+        <div className="flex flex-wrap items-center gap-2 border-b border-red-500/20 bg-red-500/10 px-3 py-2 text-[13px]">
+          <span className="min-w-0 flex-1 truncate">
+            End <b>{confirm.name}</b> (PID {confirm.pid})? Unsaved data in it may be lost.
+          </span>
+          {killError && <span className="text-red-300">{killError}</span>}
+          <button onClick={() => { setConfirm(null); setKillError(null); }} className="rounded-md px-3 py-1 text-white/70 hover:bg-white/10">
+            Cancel
+          </button>
+          <button onClick={() => void kill(confirm)} disabled={killing} className="rounded-md bg-red-500 px-3 py-1 font-medium text-white hover:bg-red-600 disabled:opacity-50">
+            End process
+          </button>
+        </div>
+      )}
+      {error && <div className="px-4 py-2 text-[12px] text-red-300">Could not read processes: {error}</div>}
+      <div className="min-h-0 flex-1 overflow-y-auto">
+        <table className="w-full table-fixed text-left text-[13px]">
+          <colgroup>
+            <col />
+            <col className="w-20" />
+            <col className="w-20" />
+            <col className="w-24" />
+            <col className="w-10" />
+          </colgroup>
+          <thead className="sticky top-0 bg-[#121520] text-[11px] text-white/45">
+            <tr>
+              {th('name', 'Name')}
+              {th('pid', 'PID', true)}
+              {th('cpu', 'CPU', true)}
+              {th('rss', 'Memory', true)}
+              <th />
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((p) => (
+              <tr key={p.pid} className={cx('border-t border-white/5 hover:bg-white/[.03]', confirm?.pid === p.pid && 'bg-red-500/10', !p.own && 'text-white/55')}>
+                <td className="truncate px-3 py-1.5" title={p.cmd}>
+                  <span className="flex items-center gap-2">
+                    <Activity size={14} className="shrink-0 text-white/30" />
+                    <span className="truncate">{p.name}</span>
+                    {p.state && p.state !== 'S' && p.state !== 'I' && <span className="shrink-0 rounded bg-white/10 px-1 text-[10px] text-white/50">{p.state}</span>}
+                  </span>
+                </td>
+                <td className="px-3 py-1.5 text-right tabular-nums text-white/50">{p.pid}</td>
+                <td className={cx('px-3 py-1.5 text-right tabular-nums', p.cpu >= 50 ? 'text-amber-300' : 'text-white/70')}>{p.cpu.toFixed(1)}%</td>
+                <td className="px-3 py-1.5 text-right tabular-nums text-white/70" title={memTotal ? `${((p.rss / memTotal) * 100).toFixed(1)}% of RAM` : undefined}>
+                  {formatBytes(p.rss)}
+                </td>
+                <td className="px-1">
+                  <button
+                    onClick={() => { setConfirm(p); setKillError(null); }}
+                    disabled={!p.own}
+                    className="rounded p-1 text-white/40 hover:bg-red-500/20 hover:text-red-300 disabled:pointer-events-none disabled:opacity-20"
+                    aria-label={`End ${p.name}`}
+                    title={p.own ? 'End process' : 'Owned by another user'}
+                  >
+                    <X size={14} />
+                  </button>
+                </td>
+              </tr>
+            ))}
+            {rows.length === 0 && (
+              <tr>
+                <td colSpan={5} className="py-10 text-center text-white/35">
+                  {procs.length ? 'No matching processes' : 'Loading processes…'}
+                </td>
+              </tr>
+            )}
+          </tbody>
+        </table>
       </div>
     </div>
   );

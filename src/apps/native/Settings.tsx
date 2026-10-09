@@ -4,7 +4,7 @@
  *  Mobile:  iOS-style grouped lists with drill-down navigation.
  *  Desktop: two-pane window (sidebar + detail).
  */
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useState, type ReactNode } from 'react';
 import {
   Wifi,
   Monitor,
@@ -17,6 +17,8 @@ import {
   ChevronRight,
   ChevronLeft,
   Search,
+  Bluetooth,
+  BatteryCharging,
   type LucideIcon,
 } from 'lucide-react';
 import type { AppProps, ModeLock, Settings as SettingsT } from '../../types';
@@ -27,6 +29,9 @@ import { useFs } from '../../lib/vfs';
 import { Slider, Toggle } from '../../components/ui';
 import { useBackHandler } from '../../lib/backStack';
 import { cx } from '../../lib/hooks';
+import { formatDuration, hasRealOs, refresh, sysActions, useSystem } from '../../lib/system';
+import { formatBytes } from '../../lib/vfs';
+import { BluetoothDevicesPanel, PowerActionsPanel, WifiNetworksPanel, type Variant } from './settings/RealPanels';
 
 type Item =
   | { kind: 'toggle'; id: string; label: string; desc?: string; value: boolean; set: (v: boolean) => void }
@@ -34,7 +39,9 @@ type Item =
   | { kind: 'choice'; id: string; label: string; desc?: string; value: string; options: { value: string; label: string; swatch?: string }[]; set: (v: string) => void }
   | { kind: 'text'; id: string; label: string; value: string; set: (v: string) => void }
   | { kind: 'info'; id: string; label: string; value: string }
-  | { kind: 'action'; id: string; label: string; desc?: string; danger?: boolean; run: () => void };
+  | { kind: 'action'; id: string; label: string; desc?: string; danger?: boolean; run: () => void }
+  /** Free-form panel (real OS lists: Wi-Fi networks, Bluetooth devices, power actions). */
+  | { kind: 'custom'; id: string; label: string; render: (variant: Variant) => ReactNode };
 
 interface Section {
   id: string;
@@ -54,12 +61,93 @@ function useSettingsModel(): Section[] {
   const [drm, setDrm] = useState<DrmStatus | null>(null);
   useEffect(() => {
     bridge.drm.status().then(setDrm).catch(() => setDrm(null));
+    if (hasRealOs) {
+      void refresh.info();
+      void refresh.power();
+      void refresh.network();
+    }
   }, []);
+  const net = useSystem((st) => st.network);
+  const bt = useSystem((st) => st.bluetooth);
+  const vol = useSystem((st) => st.volume);
+  const bright = useSystem((st) => st.brightness);
+  const battery = useSystem((st) => st.battery);
+  const info = useSystem((st) => st.info);
 
   return useMemo(() => {
     const set = <K extends keyof SettingsT>(k: K) => (v: SettingsT[K]) => update({ [k]: v } as Partial<SettingsT>);
-    return [
-      {
+
+    /* ---- real OS sections (only when the backend reports the service as available) ---- */
+    const realNetwork: Section | null = net.available
+      ? (() => {
+          const airplane = !net.wifiEnabled && (!bt.available || !bt.powered);
+          const summary = net.wifi?.ssid ? `Connected · ${net.wifi.ssid}` : net.online ? `Connected · ${net.primaryName || net.primaryType || 'wired'}` : net.wifiEnabled ? 'Not connected' : 'Wi-Fi off';
+          const items: Item[] = [];
+          if (net.wifiHardware !== false) {
+            items.push(
+              { kind: 'toggle', id: 'wifi', label: 'Wi-Fi', desc: net.wifi ? `Connected to ${net.wifi.ssid} · ${net.wifi.strength}%` : net.wifiEnabled ? 'Not connected' : 'Off', value: !!net.wifiEnabled, set: (v) => void sysActions.setWifi(v) },
+              { kind: 'custom', id: 'wifi-networks', label: 'Available networks', render: (v) => <WifiNetworksPanel variant={v} /> },
+            );
+          } else items.push({ kind: 'info', id: 'wifi-hw', label: 'Wi-Fi', value: 'No wireless adapter' });
+          items.push(
+            {
+              kind: 'toggle',
+              id: 'air',
+              label: 'Airplane mode',
+              desc: 'Turns off Wi-Fi and Bluetooth',
+              value: airplane,
+              set: (on) => {
+                void sysActions.setWifi(!on);
+                if (bt.available) void sysActions.setBluetooth(!on);
+              },
+            },
+            { kind: 'info', id: 'primary', label: 'Active connection', value: net.primaryName ? `${net.primaryName}${net.primaryType ? ` (${net.primaryType})` : ''}` : '—' },
+            { kind: 'info', id: 'online', label: 'Internet', value: net.connecting ? 'Connecting…' : net.online ? 'Online' : 'Offline' },
+          );
+          return { id: 'network', title: 'Network', icon: Wifi, color: '#3b82f6', summary, items };
+        })()
+      : null;
+
+    const realBluetooth: Section | null = bt.available
+      ? {
+          id: 'bluetooth',
+          title: 'Bluetooth',
+          icon: Bluetooth,
+          color: '#0ea5e9',
+          summary: bt.powered ? `On · ${bt.devices.filter((d) => d.connected).length} connected` : 'Off',
+          items: [
+            { kind: 'toggle', id: 'bt-power', label: 'Bluetooth', desc: bt.name ? `Visible as “${bt.name}”` : undefined, value: bt.powered, set: (v) => void sysActions.setBluetooth(v) },
+            { kind: 'custom', id: 'bt-devices', label: 'Devices', render: (v) => <BluetoothDevicesPanel variant={v} /> },
+          ],
+        }
+      : null;
+
+    const realPower: Section | null = hasRealOs
+      ? {
+          id: 'power',
+          title: battery.available ? 'Power & Battery' : 'Power',
+          icon: BatteryCharging,
+          color: '#84cc16',
+          summary: battery.available ? `${battery.level ?? 0}%${battery.charging ? ' · Charging' : battery.full ? ' · Full' : ''}` : 'AC power',
+          items: [
+            ...(battery.available
+              ? ([
+                  { kind: 'info', id: 'bat-level', label: 'Battery level', value: `${battery.level ?? 0}%` },
+                  { kind: 'info', id: 'bat-state', label: 'State', value: battery.full ? 'Fully charged' : battery.charging ? 'Charging' : 'On battery' },
+                  {
+                    kind: 'info',
+                    id: 'bat-time',
+                    label: battery.charging ? 'Time until full' : 'Time remaining',
+                    value: (battery.charging ? formatDuration(battery.timeToFull ?? 0) : formatDuration(battery.timeToEmpty ?? 0)) || '—',
+                  },
+                ] as Item[])
+              : ([{ kind: 'info', id: 'bat-none', label: 'Battery', value: 'No battery · AC power' }] as Item[])),
+            { kind: 'custom', id: 'power-actions', label: 'Power actions', render: (v) => <PowerActionsPanel variant={v} /> },
+          ],
+        }
+      : null;
+
+    const simulatedNetwork: Section = {
         id: 'network',
         title: 'Network',
         icon: Wifi,
@@ -67,20 +155,26 @@ function useSettingsModel(): Section[] {
         summary: s.airplane ? 'Airplane mode' : s.wifi ? 'Connected · OPOS-5G' : 'Wi-Fi off',
         items: [
           { kind: 'toggle', id: 'wifi', label: 'Wi-Fi', desc: s.wifi ? 'Connected to OPOS-5G · 866 Mbps' : 'Off', value: s.wifi, set: set('wifi') },
-          { kind: 'toggle', id: 'bt', label: 'Bluetooth', desc: s.bluetooth ? 'OPOS Remote, Wireless Controller' : 'Off', value: s.bluetooth, set: set('bluetooth') },
+          ...(bt.available ? [] : ([{ kind: 'toggle', id: 'bt', label: 'Bluetooth', desc: s.bluetooth ? 'OPOS Remote, Wireless Controller' : 'Off', value: s.bluetooth, set: set('bluetooth') }] as Item[])),
           { kind: 'toggle', id: 'air', label: 'Airplane mode', desc: 'Disables all wireless radios', value: s.airplane, set: set('airplane') },
           { kind: 'info', id: 'ip', label: 'IP address', value: s.wifi && !s.airplane ? '192.168.1.42' : '—' },
           { kind: 'info', id: 'online', label: 'Internet', value: navigator.onLine ? 'Online' : 'Offline' },
         ],
-      },
+      };
+
+    return [
+      realNetwork ?? simulatedNetwork,
+      ...(realBluetooth ? [realBluetooth] : []),
       {
         id: 'display',
         title: 'Display',
         icon: Monitor,
         color: '#8b5cf6',
-        summary: `${s.resolution === 'auto' ? 'Auto' : s.resolution} · ${s.brightness}%`,
+        summary: `${s.resolution === 'auto' ? 'Auto' : s.resolution} · ${bright.available ? bright.level : s.brightness}%`,
         items: [
-          { kind: 'slider', id: 'brightness', label: 'Brightness', value: s.brightness, min: 20, max: 100, unit: '%', set: set('brightness') },
+          bright.available
+            ? { kind: 'slider', id: 'brightness', label: 'Brightness', desc: bright.device ? `Backlight · ${bright.device}` : 'Screen backlight', value: bright.level, min: 1, max: 100, unit: '%', set: (v) => void sysActions.setBrightness(v) }
+            : { kind: 'slider', id: 'brightness', label: 'Brightness', value: s.brightness, min: 20, max: 100, unit: '%', set: set('brightness') },
           { kind: 'choice', id: 'res', label: 'Resolution', value: s.resolution, options: ['auto', '720p', '1080p', '1440p', '4k'].map((v) => ({ value: v, label: v === 'auto' ? 'Automatic' : v.toUpperCase() })), set: (v) => update({ resolution: v as SettingsT['resolution'] }) },
           { kind: 'toggle', id: 'hdr', label: 'HDR', desc: 'High dynamic range for supported content', value: s.hdr, set: set('hdr') },
           { kind: 'toggle', id: 'night', label: 'Night light', desc: 'Warmer colors to reduce blue light', value: s.nightLight, set: set('nightLight') },
@@ -94,9 +188,14 @@ function useSettingsModel(): Section[] {
         title: 'Sound',
         icon: Volume2,
         color: '#ec4899',
-        summary: `Volume ${s.volume}%`,
+        summary: vol.available ? (vol.muted ? `Muted · ${vol.level}%` : `Volume ${vol.level}%`) : `Volume ${s.volume}%`,
         items: [
-          { kind: 'slider', id: 'volume', label: 'Volume', value: s.volume, min: 0, max: 100, unit: '%', set: set('volume') },
+          ...(vol.available
+            ? ([
+                { kind: 'slider', id: 'volume', label: 'Output volume', desc: vol.backend ? `System output · ${vol.backend}` : 'System output', value: Math.min(100, vol.level), min: 0, max: 100, unit: '%', set: (v) => void sysActions.setVolume(v) },
+                { kind: 'toggle', id: 'mute', label: 'Mute', value: vol.muted, set: (m) => m !== vol.muted && void sysActions.toggleMute() },
+              ] as Item[])
+            : ([{ kind: 'slider', id: 'volume', label: 'Volume', value: s.volume, min: 0, max: 100, unit: '%', set: set('volume') }] as Item[])),
           { kind: 'toggle', id: 'dnd', label: 'Do not disturb', desc: 'Silence notification banners', value: s.doNotDisturb, set: set('doNotDisturb') },
           { kind: 'toggle', id: 'notif', label: 'Notifications', value: s.notifications, set: set('notifications') },
         ],
@@ -115,6 +214,7 @@ function useSettingsModel(): Section[] {
           { kind: 'info', id: 'current', label: 'Current mode', value: mode.toUpperCase() },
         ],
       },
+      ...(realPower ? [realPower] : []),
       {
         id: 'personalize',
         title: 'Personalization',
@@ -163,16 +263,44 @@ function useSettingsModel(): Section[] {
           { kind: 'info', id: 'runtime', label: 'Runtime', value: isElectron ? `Electron ${bridge.versions.electron}` : 'Web browser preview' },
           { kind: 'info', id: 'chrome', label: 'Chromium', value: bridge.versions.chrome ?? navigator.userAgent.match(/Chrome\/([\d.]+)/)?.[1] ?? '—' },
           { kind: 'info', id: 'platform', label: 'Platform', value: bridge.platform },
-          { kind: 'info', id: 'cores', label: 'CPU threads', value: String(navigator.hardwareConcurrency ?? '—') },
+          ...(info
+            ? ([
+                { kind: 'info', id: 'os', label: 'Operating system', value: info.os },
+                { kind: 'info', id: 'kernel', label: 'Kernel', value: `${info.kernel} (${info.arch})` },
+                { kind: 'info', id: 'host', label: 'Hostname', value: info.hostname },
+                { kind: 'info', id: 'user', label: 'User', value: info.user },
+                { kind: 'info', id: 'cpu', label: 'Processor', value: `${info.cpu} · ${info.cores} threads` },
+                { kind: 'info', id: 'mem', label: 'Memory', value: formatBytes(info.memTotal) },
+                { kind: 'info', id: 'uptime', label: 'Uptime', value: formatUptime(info.uptime) },
+                ...(info.session || info.desktop ? [{ kind: 'info', id: 'session', label: 'Session', value: [info.desktop, info.session].filter(Boolean).join(' · ') } as Item] : []),
+              ] as Item[])
+            : ([{ kind: 'info', id: 'cores', label: 'CPU threads', value: String(navigator.hardwareConcurrency ?? '—') }] as Item[])),
         ],
       },
     ];
-  }, [s, modeLock, mode, drm, update, setModeLock]);
+  }, [s, modeLock, mode, drm, update, setModeLock, net, bt, vol, bright, battery, info]);
+}
+
+function formatUptime(sec: number) {
+  const d = Math.floor(sec / 86400);
+  const rest = formatDuration(sec % 86400) || '0 min';
+  return d ? `${d} d ${rest}` : rest;
+}
+
+/** Deep-link aliases → section ids (sections that only exist with a real backend fall back sensibly). */
+const SECTION_ALIASES: Record<string, string> = { wifi: 'network', battery: 'power', volume: 'sound', audio: 'sound', brightness: 'display', system: 'about' };
+function resolveSection(sections: Section[], id: string | null): string | null {
+  if (!id) return null;
+  if (sections.some((s) => s.id === id)) return id;
+  const alias = SECTION_ALIASES[id];
+  if (alias && sections.some((s) => s.id === alias)) return alias;
+  if (id === 'bluetooth') return 'network';
+  return null;
 }
 
 export default function SettingsApp({ mode, pid, params }: AppProps) {
   const sections = useSettingsModel();
-  const initial = (params?.section as string) ?? null;
+  const initial = resolveSection(sections, (params?.section as string) ?? null);
   if (mode === 'tv') return <TVSettings sections={sections} initial={initial} pid={pid} />;
   if (mode === 'mobile') return <MobileSettings sections={sections} initial={initial} pid={pid} />;
   return <DesktopSettings sections={sections} initial={initial} />;
@@ -301,6 +429,13 @@ function TVItem({ item, first }: { item: Item; first: boolean }) {
         <div className={base}>
           {label}
           <input data-autofocus={af} className="w-[40%] rounded-2xl bg-black/40 px-6 py-3 text-3xl outline-none" value={item.value} onChange={(e) => item.set(e.target.value)} />
+        </div>
+      );
+    case 'custom':
+      return (
+        <div className="mb-4 rounded-3xl bg-white/[.06] px-10 py-7">
+          <div className="mb-4 text-4xl font-bold">{item.label}</div>
+          {item.render('tv')}
         </div>
       );
     case 'action':
@@ -444,6 +579,13 @@ function MobileItem({ item }: { item: Item }) {
           <span className="ml-auto max-w-[60%] truncate text-[15px] text-white/45">{item.value}</span>
         </div>
       );
+    case 'custom':
+      return (
+        <div>
+          <div className="mb-2 text-[13px] uppercase tracking-wide text-white/45">{item.label}</div>
+          {item.render('mobile')}
+        </div>
+      );
     case 'action':
       return (
         <button className={cx('w-full text-left text-[16px]', item.danger ? 'text-red-400' : 'text-os-accent')} onClick={item.run}>
@@ -569,6 +711,13 @@ function DesktopItem({ item }: { item: Item }) {
         <div className="flex items-center gap-4">
           {head}
           <span className="selectable max-w-[60%] break-all text-right font-mono text-[12px] text-white/55">{item.value}</span>
+        </div>
+      );
+    case 'custom':
+      return (
+        <div>
+          <div className="mb-2 text-[14px]">{item.label}</div>
+          {item.render('desktop')}
         </div>
       );
     case 'action':
