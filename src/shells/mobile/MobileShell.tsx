@@ -5,18 +5,48 @@
 import { useMemo, useRef, useState, type PointerEvent as RPE } from 'react';
 import { ChevronLeft, Circle, Square, Wifi, WifiOff, Signal, Search, X, Play, Pause, SkipForward, Plane, BatteryCharging } from 'lucide-react';
 import { useOS, selectForeground } from '../../store/useOS';
-import { APPS, getApp, searchApps } from '../../apps/manifest';
-import { AppIcon } from '../../components/AppIcon';
+import { bridge, isSession } from '../../lib/bridge';
+import { findLaunchable, focusWindow, closeWindow, launch, LaunchableIcon, searchLaunchables, useLaunchables, useRunningGroups, NativeIcon, type Launchable } from '../../session/launcher';
 import { MOBILE_NAV_H, MOBILE_STATUS_H } from '../../components/ProcessLayer';
 import { QuickSettings } from '../QuickSettings';
 import { WALLPAPERS } from '../../lib/theme';
 import { performBack } from '../../lib/backStack';
 import { audio, useAudio, TRACKS } from '../../lib/audioEngine';
 import { useWeather } from '../../lib/weather';
-import { cx, useBattery, useClock, useOnline, useTimeFormat } from '../../lib/hooks';
-import type { AppDefinition } from '../../types';
+import { cx, useClock, useTimeFormat } from '../../lib/hooks';
+import { useTrayStatus } from '../desktop/Taskbar';
 
 const PER_PAGE = 20;
+
+/** Launcher pages: OPOS mobile apps, then installed apps, then everything else. */
+function useMobilePages(dock: string[]) {
+  const items = useLaunchables();
+  return useMemo(() => {
+    const order = (l: Launchable) => (l.kind === 'opos' ? ['mobile', 'system', 'tv', 'desktop'].indexOf(l.category) * 2 : 1);
+    const apps = items.filter((a) => !dock.includes(a.key)).sort((a, b) => order(a) - order(b) || 0);
+    // First page hosts widgets + 8 apps; the rest are full 4x5 grids.
+    const out: Launchable[][] = [apps.slice(0, 8)];
+    for (let i = 8; i < apps.length; i += PER_PAGE) out.push(apps.slice(i, i + PER_PAGE));
+    return out;
+  }, [items, dock]);
+}
+
+/** Wallpaper + widgets + paginated launcher + dock (the session's mobile desktop surface). */
+export function MobileHome() {
+  const wallpaper = useOS((s) => s.settings.wallpaper);
+  const dock = useOS((s) => s.mobileDock);
+  const pages = useMobilePages(dock);
+  return (
+    <div className="absolute inset-0 select-none" data-nav-scope data-nav-priority="0">
+      <div className="absolute inset-0" style={{ background: WALLPAPERS[wallpaper]?.css ?? WALLPAPERS.aurora.css }} />
+      <div className="absolute inset-0 bg-black/20" />
+      <div className="absolute inset-x-0 flex flex-col" style={{ top: MOBILE_STATUS_H, bottom: MOBILE_NAV_H }}>
+        <Pager pages={pages} />
+        <Dock ids={dock} />
+      </div>
+    </div>
+  );
+}
 
 export function MobileShell() {
   const wallpaper = useOS((s) => s.settings.wallpaper);
@@ -24,14 +54,7 @@ export function MobileShell() {
   const dock = useOS((s) => s.mobileDock);
   const foreground = useOS(selectForeground);
 
-  const pages = useMemo(() => {
-    const order = ['mobile', 'system', 'tv', 'desktop'];
-    const apps = APPS.filter((a) => !dock.includes(a.id)).sort((a, b) => order.indexOf(a.category) - order.indexOf(b.category));
-    // First page hosts widgets + 8 apps; the rest are full 4x5 grids.
-    const out: AppDefinition[][] = [apps.slice(0, 8)];
-    for (let i = 8; i < apps.length; i += PER_PAGE) out.push(apps.slice(i, i + PER_PAGE));
-    return out;
-  }, [dock]);
+  const pages = useMobilePages(dock);
 
   return (
     <div className="absolute inset-0 select-none" data-nav-scope data-nav-priority="0">
@@ -55,11 +78,12 @@ export function MobileShell() {
 
 /* --------------------------------------------------------------- status bar */
 
-function StatusBar({ dark }: { dark: boolean }) {
+export function StatusBar({ dark }: { dark: boolean }) {
   const now = useClock(5000);
   const fmt = useTimeFormat();
-  const battery = useBattery();
-  const online = useOnline();
+  const tray = useTrayStatus();
+  const battery = { level: tray.battery.level, charging: tray.battery.charging };
+  const online = tray.network.online;
   const airplane = useOS((s) => s.settings.airplane);
   const setOverlay = useOS((s) => s.setOverlay);
   const startY = useRef<number | null>(null);
@@ -91,7 +115,7 @@ function StatusBar({ dark }: { dark: boolean }) {
 
 /* --------------------------------------------------------------------- pager */
 
-function Pager({ pages }: { pages: AppDefinition[][] }) {
+function Pager({ pages }: { pages: Launchable[][] }) {
   const [page, setPage] = useState(0);
   const [drag, setDrag] = useState(0);
   const ref = useRef<HTMLDivElement>(null);
@@ -144,7 +168,7 @@ function Pager({ pages }: { pages: AppDefinition[][] }) {
               {i === 0 && <Widgets />}
               <div className="grid grid-cols-4 content-start gap-x-3 gap-y-5">
                 {apps.map((a) => (
-                  <LauncherIcon key={a.id} app={a} />
+                  <LauncherIcon key={a.key} app={a} />
                 ))}
               </div>
             </div>
@@ -160,22 +184,21 @@ function Pager({ pages }: { pages: AppDefinition[][] }) {
   );
 }
 
-function LauncherIcon({ app, label = true }: { app: AppDefinition; label?: boolean }) {
-  const launch = useOS((s) => s.launch);
+function LauncherIcon({ app, label = true }: { app: Launchable; label?: boolean }) {
   const openContextMenu = useOS((s) => s.openContextMenu);
   return (
     <button
       className="flex flex-col items-center gap-1.5 transition active:scale-90"
-      onClick={() => launch(app.id)}
+      onClick={() => launch(app)}
       onContextMenu={(e) => {
         e.preventDefault();
         openContextMenu(e.clientX, e.clientY, [
-          { label: `Open ${app.name}`, action: () => launch(app.id) },
-          { label: app.description, disabled: true },
+          { label: `Open ${app.name}`, action: () => launch(app) },
+          ...(app.description ? [{ label: app.description, disabled: true }] : []),
         ]);
       }}
     >
-      <AppIcon app={app} size={58} />
+      <LaunchableIcon item={app} size={58} />
       {label && <span className="w-full truncate text-center text-[11px] font-medium text-white [text-shadow:0_1px_4px_rgba(0,0,0,.8)]">{app.name.replace('OPOS ', '')}</span>}
     </button>
   );
@@ -222,10 +245,11 @@ function Widgets() {
 }
 
 function Dock({ ids }: { ids: string[] }) {
+  const installed = useOS((s) => s.installedApps);
   return (
     <div className="mx-3 mb-2 grid grid-cols-4 gap-3 rounded-[2rem] bg-white/15 px-4 py-3 backdrop-blur-2xl">
       {ids.map((id) => {
-        const a = getApp(id);
+        const a = findLaunchable(id, installed);
         return a ? <LauncherIcon key={id} app={a} label={false} /> : null;
       })}
     </div>
@@ -234,13 +258,13 @@ function Dock({ ids }: { ids: string[] }) {
 
 /* ------------------------------------------------------------------- nav bar */
 
-function NavBar() {
+export function NavBar() {
   const { goHome, toggleOverlay } = useOS.getState();
   const overlay = useOS((s) => s.overlay);
   const btn = 'grid h-full flex-1 place-items-center text-white/85 transition active:scale-90 active:text-white';
   return (
     <div className="absolute inset-x-0 bottom-0 z-[9000] flex items-center bg-black/85 backdrop-blur-xl" style={{ height: MOBILE_NAV_H }}>
-      <button className={btn} onClick={() => performBack()} aria-label="Back">
+      <button className={btn} onClick={() => (isSession ? void bridge.session?.back() : performBack())} aria-label="Back">
         <ChevronLeft size={24} />
       </button>
       <button className={btn} onClick={goHome} aria-label="Home">
@@ -255,19 +279,19 @@ function NavBar() {
 
 /* ------------------------------------------------------------------- recents */
 
-function Recents() {
-  const processes = useOS((s) => s.processes);
-  const { focus, close, closeAll, setOverlay } = useOS.getState();
-  const cards = [...processes].sort((a, b) => b.z - a.z);
+export function Recents() {
+  const groups = useRunningGroups();
+  const { setOverlay, closeAll } = useOS.getState();
+  const cards = groups.flatMap((g) => g.windows.map((w) => ({ ...w, group: g })));
   return (
-    <div className="absolute inset-x-0 top-0 z-[9500] flex animate-fade-in flex-col bg-black/75 backdrop-blur-xl" style={{ bottom: MOBILE_NAV_H }} onClick={() => setOverlay('none')} data-nav-scope data-nav-priority="30">
+    <div className="absolute inset-x-0 top-0 z-[9500] flex animate-fade-in flex-col bg-black/75 backdrop-blur-xl" style={{ bottom: isSession ? 0 : MOBILE_NAV_H }} onClick={() => setOverlay('none')} data-nav-scope data-nav-priority="30">
       <div className="mt-12 px-6 text-sm font-semibold text-white/70">Recent apps</div>
       {cards.length === 0 ? (
         <div className="grid flex-1 place-items-center text-sm text-white/50">No recent apps</div>
       ) : (
         <div className="no-scrollbar flex flex-1 snap-x snap-mandatory items-center gap-4 overflow-x-auto px-[15%]">
-          {cards.map((p) => (
-            <RecentCard key={p.pid} pid={p.pid} appId={p.appId} title={p.title} onOpen={() => focus(p.pid)} onClose={() => close(p.pid)} />
+          {cards.map((c) => (
+            <RecentCard key={c.id} item={c.group.item} name={c.group.name} title={c.title} onOpen={() => { focusWindow(c.id); setOverlay('none'); }} onClose={() => closeWindow(c.id)} />
           ))}
         </div>
       )}
@@ -276,7 +300,8 @@ function Recents() {
           className="mx-auto mb-6 rounded-full bg-white/15 px-5 py-2 text-sm font-medium text-white"
           onClick={(e) => {
             e.stopPropagation();
-            closeAll();
+            if (isSession) cards.forEach((c) => closeWindow(c.id));
+            else closeAll();
             setOverlay('none');
           }}
         >
@@ -287,8 +312,9 @@ function Recents() {
   );
 }
 
-function RecentCard({ appId, title, onOpen, onClose }: { pid: string; appId: string; title: string; onOpen: () => void; onClose: () => void }) {
-  const app = getApp(appId)!;
+function RecentCard({ item, name, title, onOpen, onClose }: { item: Launchable | null; name: string; title: string; onOpen: () => void; onClose: () => void }) {
+  const accent = item?.opos?.accent ?? '#7c8cff';
+  const icon = (size: number) => (item ? <LaunchableIcon item={item} size={size} /> : <NativeIcon src={null} name={name} size={size} />);
   const [dy, setDy] = useState(0);
   const start = useRef<number | null>(null);
   return (
@@ -310,7 +336,7 @@ function RecentCard({ appId, title, onOpen, onClose }: { pid: string; appId: str
       }}
     >
       <div className="flex items-center gap-2 px-1">
-        <AppIcon app={app} size={24} />
+        {icon(24)}
         <span className="flex-1 truncate text-sm font-medium text-white">{title}</span>
         <button
           className="rounded-full bg-white/10 p-1 text-white/70"
@@ -323,10 +349,8 @@ function RecentCard({ appId, title, onOpen, onClose }: { pid: string; appId: str
           <X size={14} />
         </button>
       </div>
-      <div className="relative flex-1 overflow-hidden rounded-3xl border border-white/10 shadow-2xl" style={{ background: `radial-gradient(circle at 50% 30%, ${app.accent}66, #0b0c12 70%)` }}>
-        <div className="absolute inset-0 grid place-items-center">
-          <AppIcon app={app} size={88} />
-        </div>
+      <div className="relative flex-1 overflow-hidden rounded-3xl border border-white/10 shadow-2xl" style={{ background: `radial-gradient(circle at 50% 30%, ${accent}66, #0b0c12 70%)` }}>
+        <div className="absolute inset-0 grid place-items-center">{icon(88)}</div>
         <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/80 to-transparent p-4 text-xs text-white/60">Swipe up to close</div>
       </div>
     </div>
@@ -335,7 +359,7 @@ function RecentCard({ appId, title, onOpen, onClose }: { pid: string; appId: str
 
 /* ------------------------------------------------------------ control center */
 
-function ControlCenter() {
+export function ControlCenter() {
   const setOverlay = useOS((s) => s.setOverlay);
   const { playing, index } = useAudio();
   const track = TRACKS[index];
@@ -362,10 +386,11 @@ function ControlCenter() {
   );
 }
 
-function SearchSheet() {
+export function SearchSheet() {
   const [q, setQ] = useState('');
   const setOverlay = useOS((s) => s.setOverlay);
-  const results = searchApps(q);
+  const items = useLaunchables();
+  const results = searchLaunchables(items, q);
   return (
     <div className="absolute inset-x-0 top-0 z-[9500] flex animate-fade-in flex-col bg-black/70 px-4 pt-10 backdrop-blur-2xl" style={{ bottom: MOBILE_NAV_H }} data-nav-scope data-nav-priority="30">
       <div className="flex items-center gap-2">
@@ -379,7 +404,7 @@ function SearchSheet() {
       </div>
       <div className="mt-6 grid grid-cols-4 gap-y-5 overflow-y-auto">
         {results.map((a) => (
-          <LauncherIcon key={a.id} app={a} />
+          <LauncherIcon key={a.key} app={a} />
         ))}
       </div>
     </div>

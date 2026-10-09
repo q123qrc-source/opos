@@ -15,6 +15,7 @@ import { create } from 'zustand';
 import { persist, createJSONStorage } from 'zustand/middleware';
 import type { Bounds, InputKind, Mode, ModeLock, Process, Settings, Toast } from '../types';
 import { getApp } from '../apps/manifest';
+import { bridge, isSession, type InstalledApp, type SessionWindow } from '../lib/bridge';
 
 export const TASKBAR_HEIGHT = 52;
 const TV_KEYS = new Set(['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Enter']);
@@ -78,6 +79,14 @@ interface OSState {
   setBounds: (pid: string, bounds: Partial<Bounds>) => void;
   setTitle: (pid: string, title: string) => void;
   goHome: () => void;
+
+  /* real session (OPOS as the desktop): KWin-managed windows + installed Linux apps */
+  windows: SessionWindow[];
+  screen: { x: number; y: number; w: number; h: number } | null;
+  installedApps: InstalledApp[];
+  launchNative: (desktopId: string, opts?: { action?: string; targets?: string[] }) => void;
+  windowOp: (op: 'activate' | 'minimize' | 'toggleMinimize' | 'close' | 'toggleMaximize', id: string) => void;
+  logout: () => void;
 
   /* settings */
   settings: Settings;
@@ -222,6 +231,12 @@ export const useOS = create<OSState>()(
         const app = getApp(appId);
         if (!app) return null;
         const s = get();
+        if (isSession) {
+          // In a real session every OPOS app is its own compositor-managed window.
+          void bridge.session!.openApp(appId, params);
+          if (s.overlay !== 'none') set({ overlay: 'none' });
+          return `session:${appId}`;
+        }
         if (app.singleInstance) {
           const existing = s.processes.find((p) => p.appId === appId);
           if (existing) {
@@ -298,7 +313,12 @@ export const useOS = create<OSState>()(
       setTitle: (pid, title) =>
         set((s) => ({ processes: s.processes.map((p) => (p.pid === pid ? { ...p, title } : p)) })),
 
-      goHome: () =>
+      goHome: () => {
+        if (isSession) {
+          set({ overlay: 'none' });
+          void bridge.session!.home();
+          return;
+        }
         set((s) => ({
           focusedPid: null,
           overlay: 'none',
@@ -306,7 +326,22 @@ export const useOS = create<OSState>()(
             s.mode === 'desktop'
               ? s.processes.map((p) => (getApp(p.appId)?.launch === 'floating' ? p : { ...p, minimized: true }))
               : s.processes,
-        })),
+        }));
+      },
+
+      windows: [],
+      screen: null,
+      installedApps: [],
+      launchNative: (desktopId, opts) => {
+        set({ overlay: 'none' });
+        bridge.apps?.launch(desktopId, opts).catch((e: Error) => get().notify('Could not start app', e.message));
+      },
+      windowOp: (op, id) => {
+        void bridge.session?.window(op, id);
+      },
+      logout: () => {
+        void bridge.session?.logout();
+      },
 
       /* ----------------------------------------------------------------- settings */
       settings: DEFAULT_SETTINGS,
@@ -344,7 +379,8 @@ export const useOS = create<OSState>()(
       name: 'opos-shell',
       version: 1,
       storage: createJSONStorage(() => localStorage),
-      partialize: (s) => ({ settings: s.settings, pinned: s.pinned, modeLock: s.modeLock }),
+      // In a session, preferences live in the main process (~/.config/opos/state.json) instead.
+      partialize: (s) => (isSession ? {} : { settings: s.settings, pinned: s.pinned, modeLock: s.modeLock }),
       merge: (persisted, current) => {
         const p = (persisted ?? {}) as Partial<OSState>;
         const merged = { ...current, ...p, settings: { ...DEFAULT_SETTINGS, ...(p.settings ?? {}) } };

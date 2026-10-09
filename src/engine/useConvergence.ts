@@ -21,7 +21,17 @@ function isEditableTarget(t: EventTarget | null) {
   return el.isContentEditable || el.tagName === 'TEXTAREA' || (el.tagName === 'INPUT' && (el as HTMLInputElement).type !== 'range');
 }
 
-export function useConvergence() {
+export interface ConvergenceOptions {
+  /** Session surfaces: viewport size is not the screen size, so skip resize heuristics, the idle
+   * screensaver and fullscreen toggling (the session manager owns those). */
+  session?: boolean;
+  /** Whether this renderer should react to hardware media keys with the built-in audio engine. */
+  mediaKeys?: boolean;
+}
+
+export function useConvergence(opts: ConvergenceOptions = {}) {
+  const session = !!opts.session;
+  const mediaKeys = opts.mediaKeys ?? true;
   const mode = useOS((s) => s.mode);
   const tvFullscreen = useOS((s) => s.settings.tvFullscreen);
 
@@ -67,7 +77,7 @@ export function useConvergence() {
     window.addEventListener('pointerdown', onPointerDown, { passive: true, capture: true });
     window.addEventListener('touchstart', onTouch, { passive: true, capture: true });
     window.addEventListener('keydown', onKey, true);
-    window.addEventListener('resize', onResize);
+    if (!session) window.addEventListener('resize', onResize);
     return () => {
       window.removeEventListener('pointermove', onPointerMove);
       window.removeEventListener('pointerdown', onPointerDown, true);
@@ -82,15 +92,15 @@ export function useConvergence() {
     const root = document.documentElement;
     root.classList.remove('mode-desktop', 'mode-mobile', 'mode-tv');
     root.classList.add(`mode-${mode}`);
-    bridge.mode.changed(mode);
+    if (!session) bridge.mode.changed(mode);
     if (mode === 'tv') {
-      if (tvFullscreen) bridge.window.setFullscreen(true);
+      if (tvFullscreen && !session) bridge.window.setFullscreen(true);
       const t = window.setTimeout(ensureFocus, 60);
       return () => window.clearTimeout(t);
     }
     resetSpatial();
-    if (tvFullscreen) bridge.window.setFullscreen(false);
-  }, [mode, tvFullscreen]);
+    if (tvFullscreen && !session) bridge.window.setFullscreen(false);
+  }, [mode, tvFullscreen, session]);
 
   useEffect(
     () =>
@@ -122,7 +132,7 @@ export function useConvergence() {
   }, [mode]);
 
   /* ----------------------------------------------------------------- media keys */
-  useEffect(() => bridge.media.onKey(routeMedia), []);
+  useEffect(() => (mediaKeys ? bridge.media.onKey(routeMedia) : undefined), [mediaKeys]);
 
   /* --------------------------------------------- gamepad -> D-pad key events */
   useEffect(() => {
@@ -176,6 +186,7 @@ export function useConvergence() {
 
   /* --------------------------------------------------------- idle screensaver */
   useEffect(() => {
+    if (session) return; // the compositor / screen locker handles idle in a real session
     let lastActivity = Date.now();
     const bump = () => (lastActivity = Date.now());
     const events = ['pointermove', 'pointerdown', 'keydown', 'wheel', 'touchstart'];
@@ -195,7 +206,7 @@ export function useConvergence() {
       events.forEach((e) => window.removeEventListener(e, bump, true));
       window.clearInterval(id);
     };
-  }, []);
+  }, [session]);
 
   /* ----------------------------------------------------------- volume binding */
   useEffect(

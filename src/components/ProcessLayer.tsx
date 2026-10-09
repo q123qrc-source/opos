@@ -140,7 +140,7 @@ function ProcessFrame({ process: p, mode, rank, focused, foreground }: { process
   );
 }
 
-function AppContent({ process: p, mode, active }: { process: Process; mode: Mode; active: boolean }) {
+export function AppContent({ process: p, mode, active }: { process: Process; mode: Mode; active: boolean }) {
   const app = getApp(p.appId)!;
   if (app.kind === 'webview') return <WebApp app={app} pid={p.pid} mode={mode} active={active} />;
   const Comp = APP_COMPONENTS[p.appId];
@@ -148,7 +148,7 @@ function AppContent({ process: p, mode, active }: { process: Process; mode: Mode
   return <Comp pid={p.pid} mode={mode} params={p.params} />;
 }
 
-function AppSplash({ appId }: { appId: string }) {
+export function AppSplash({ appId }: { appId: string }) {
   const app = getApp(appId)!;
   return (
     <div className="grid h-full w-full place-items-center bg-[#0b0c12]">
@@ -160,7 +160,7 @@ function AppSplash({ appId }: { appId: string }) {
   );
 }
 
-class AppErrorBoundary extends Component<{ appName: string; children: ReactNode }, { error: Error | null }> {
+export class AppErrorBoundary extends Component<{ appName: string; children: ReactNode }, { error: Error | null }> {
   state = { error: null as Error | null };
   static getDerivedStateFromError(error: Error) {
     return { error };

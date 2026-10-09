@@ -1,11 +1,11 @@
 import { useMemo } from 'react';
-import { Search, Wifi, WifiOff, Volume2, VolumeX, BatteryCharging, Battery, Minus, Square, X, Monitor, Smartphone, Tv, Zap, Bell } from 'lucide-react';
+import { Search, Wifi, WifiOff, Volume2, VolumeX, BatteryCharging, Battery, Minus, Square, X, Monitor, Smartphone, Tv, Zap, Bell, Network } from 'lucide-react';
 import { useOS, TASKBAR_HEIGHT } from '../../store/useOS';
-import { getApp } from '../../apps/manifest';
-import { AppIcon } from '../../components/AppIcon';
-import { bridge, isElectron } from '../../lib/bridge';
+import { bridge, isElectron, isSession } from '../../lib/bridge';
 import { useWeather } from '../../lib/weather';
+import { useSystem } from '../../lib/system';
 import { cx, useBattery, useClock, useOnline, useTimeFormat } from '../../lib/hooks';
+import { activateGroup, closeWindow, findLaunchable, focusWindow, launch, LaunchableIcon, NativeIcon, useRunningGroups } from '../../session/launcher';
 
 function StartGlyph() {
   return (
@@ -24,43 +24,54 @@ function StartGlyph() {
   );
 }
 
+/** Tray status that prefers real system services (UPower / NetworkManager / PipeWire) when present. */
+export function useTrayStatus() {
+  const realBattery = useSystem((s) => s.battery);
+  const net = useSystem((s) => s.network);
+  const vol = useSystem((s) => s.volume);
+  const webBattery = useBattery();
+  const webOnline = useOnline();
+  const settingsVolume = useOS((s) => s.settings.volume);
+  return {
+    // In Electron, Chromium's Battery API is a stub (always 100 %): trust UPower only.
+    battery: realBattery.available
+      ? { level: (realBattery.level ?? 0) / 100, charging: !!realBattery.charging, present: true }
+      : { level: webBattery.level, charging: webBattery.charging, present: !isElectron },
+    network: net.available
+      ? { online: !!net.online, kind: net.primaryType === 'wired' ? 'wired' : net.wifi || net.primaryType === 'wifi' ? 'wifi' : net.online ? 'wired' : 'offline', label: net.wifi?.ssid ?? net.primaryName ?? '' }
+      : { online: webOnline, kind: webOnline ? 'wifi' : 'offline', label: '' },
+    volume: vol.available ? { level: vol.level, muted: vol.muted } : { level: settingsVolume, muted: settingsVolume === 0 },
+  };
+}
+
 export function Taskbar() {
-  const processes = useOS((s) => s.processes);
   const pinned = useOS((s) => s.pinned);
-  const focusedPid = useOS((s) => s.focusedPid);
+  const installed = useOS((s) => s.installedApps);
   const overlay = useOS((s) => s.overlay);
   const mode = useOS((s) => s.mode);
   const modeLock = useOS((s) => s.modeLock);
-  const volume = useOS((s) => s.settings.volume);
   const historyCount = useOS((s) => s.history.length);
-  const { launch, focus, minimize, toggleOverlay, openContextMenu, togglePin, close, goHome } = useOS.getState();
+  const { toggleOverlay, openContextMenu, togglePin, goHome } = useOS.getState();
   const now = useClock(1000);
   const fmt = useTimeFormat();
-  const battery = useBattery();
-  const online = useOnline();
   const weather = useWeather();
+  const tray = useTrayStatus();
+  const groups = useRunningGroups();
 
   // Pinned apps first (in pin order), then running-but-unpinned apps.
   const items = useMemo(() => {
-    const running = processes.map((p) => p.appId);
-    return [...pinned, ...running.filter((id, i) => !pinned.includes(id) && running.indexOf(id) === i)];
-  }, [processes, pinned]);
-
-  const onItemClick = (appId: string) => {
-    const procs = processes.filter((p) => p.appId === appId);
-    if (!procs.length) return launch(appId);
-    const top = [...procs].sort((a, b) => b.z - a.z)[0];
-    if (procs.length === 1) {
-      if (top.pid === focusedPid && !top.minimized) minimize(top.pid);
-      else focus(top.pid);
-      return;
-    }
-    // Cycle through multiple windows of the same app.
-    const idx = procs.findIndex((p) => p.pid === focusedPid);
-    focus(procs[(idx + 1) % procs.length].pid);
-  };
+    const keys = [...pinned, ...groups.map((g) => g.key).filter((k) => !pinned.includes(k))];
+    return keys
+      .map((key) => {
+        const group = groups.find((g) => g.key === key);
+        const item = group?.item ?? findLaunchable(key, installed);
+        return item || group ? { key, item, group, name: item?.name ?? group!.name } : null;
+      })
+      .filter(Boolean) as { key: string; item: ReturnType<typeof findLaunchable>; group: ReturnType<typeof useRunningGroups>[number] | undefined; name: string }[];
+  }, [pinned, groups, installed]);
 
   const ModeIcon = modeLock === 'auto' ? Zap : { desktop: Monitor, mobile: Smartphone, tv: Tv }[mode];
+  const NetIcon = tray.network.kind === 'wired' ? Network : tray.network.online ? Wifi : WifiOff;
 
   return (
     <div
@@ -76,7 +87,7 @@ export function Taskbar() {
         ]);
       }}
     >
-      {/* Left: weather-ish widget */}
+      {/* Left: weather widget */}
       <button className="hidden shrink-0 items-center gap-2 rounded-lg px-2 py-1 text-left hover:bg-white/10 xl:flex" onClick={() => launch('weather')}>
         <span className="text-2xl leading-none">{weather.current?.emoji ?? '⛅'}</span>
         <span className="leading-tight">
@@ -94,41 +105,33 @@ export function Taskbar() {
         >
           <StartGlyph />
         </button>
-        <button
-          className="mr-1 hidden h-9 w-44 shrink-0 items-center gap-2 rounded-full bg-white/[.08] px-3 text-[13px] text-white/50 hover:bg-white/[.12] md:flex"
-          onClick={() => toggleOverlay('start')}
-        >
+        <button className="mr-1 hidden h-9 w-44 shrink-0 items-center gap-2 rounded-full bg-white/[.08] px-3 text-[13px] text-white/50 hover:bg-white/[.12] md:flex" onClick={() => toggleOverlay('start')}>
           <Search size={15} /> Search
         </button>
-        {items.map((appId) => {
-          const app = getApp(appId);
-          if (!app) return null;
-          const procs = processes.filter((p) => p.appId === appId);
-          const active = procs.some((p) => p.pid === focusedPid && !p.minimized);
+        {items.map(({ key, item, group, name }) => {
+          const running = !!group?.windows.length;
+          const active = !!group?.active;
           return (
             <button
-              key={appId}
-              title={app.name}
+              key={key}
+              title={group?.windows.length === 1 ? group.windows[0].title : name}
               className={cx('group relative grid h-10 w-10 shrink-0 place-items-center rounded-lg transition hover:bg-white/10 active:scale-90', active && 'bg-white/10')}
-              onClick={() => onItemClick(appId)}
+              onClick={() => activateGroup(key, group)}
               onContextMenu={(e) => {
                 e.preventDefault();
                 e.stopPropagation();
                 openContextMenu(e.clientX, e.clientY - 10, [
-                  { label: app.name, disabled: true },
+                  { label: name, disabled: true },
+                  ...(group?.windows.length ? group.windows.map((w) => ({ label: `↳ ${w.title}`, action: () => focusWindow(w.id) })) : []),
                   { label: '', divider: true },
-                  { label: procs.length && !app.singleInstance ? 'New window' : 'Open', action: () => launch(appId) },
-                  { label: pinned.includes(appId) ? 'Unpin from taskbar' : 'Pin to taskbar', action: () => togglePin(appId) },
-                  ...(procs.length
-                    ? [{ label: procs.length > 1 ? 'Close all windows' : 'Close window', danger: true, action: () => procs.forEach((p) => close(p.pid)) }]
-                    : []),
+                  { label: running ? 'New window' : 'Open', action: () => launch(key) },
+                  { label: pinned.includes(key) ? 'Unpin from taskbar' : 'Pin to taskbar', action: () => togglePin(key) },
+                  ...(group?.windows.length ? [{ label: group.windows.length > 1 ? 'Close all windows' : 'Close window', danger: true, action: () => group.windows.forEach((w) => closeWindow(w.id)) }] : []),
                 ]);
               }}
             >
-              <AppIcon app={app} size={26} className="transition group-hover:-translate-y-0.5" />
-              {procs.length > 0 && (
-                <span className={cx('absolute bottom-0.5 h-[3px] rounded-full transition-all', active ? 'w-4 bg-os-accent' : 'w-1.5 bg-white/50')} />
-              )}
+              <div className="transition group-hover:-translate-y-0.5">{item ? <LaunchableIcon item={item} size={26} /> : <NativeIcon src={null} name={name} size={26} />}</div>
+              {running && <span className={cx('absolute bottom-0.5 h-[3px] rounded-full transition-all', active ? 'w-4 bg-os-accent' : 'w-1.5 bg-white/50')} />}
             </button>
           );
         })}
@@ -140,11 +143,17 @@ export function Taskbar() {
           className={cx('flex h-10 items-center gap-2.5 rounded-lg px-2.5 text-white/85 hover:bg-white/10', overlay === 'quick' && 'bg-white/10')}
           onClick={() => toggleOverlay('quick')}
           aria-label="Quick settings"
+          title={tray.network.label || undefined}
         >
           <ModeIcon size={15} className="text-os-accent" />
-          {online ? <Wifi size={16} /> : <WifiOff size={16} className="text-white/40" />}
-          {volume === 0 ? <VolumeX size={16} /> : <Volume2 size={16} />}
-          {battery.charging ? <BatteryCharging size={17} /> : <Battery size={17} />}
+          <NetIcon size={16} className={tray.network.online ? '' : 'text-white/40'} />
+          {tray.volume.muted || tray.volume.level === 0 ? <VolumeX size={16} /> : <Volume2 size={16} />}
+          {tray.battery.present && (
+            <span className="flex items-center gap-1 text-[12px]">
+              {tray.battery.charging ? <BatteryCharging size={17} /> : <Battery size={17} />}
+              {isSession && `${Math.round(tray.battery.level * 100)}%`}
+            </span>
+          )}
         </button>
         <button
           className={cx('relative flex h-10 flex-col items-end justify-center rounded-lg px-2.5 text-right leading-tight hover:bg-white/10', overlay === 'notifications' && 'bg-white/10')}
@@ -154,7 +163,7 @@ export function Taskbar() {
           <span className="text-[11px] text-white/55">{now.toLocaleDateString()}</span>
           {historyCount > 0 && <Bell size={9} className="absolute right-0.5 top-1 text-os-accent" />}
         </button>
-        {isElectron && (
+        {isElectron && !isSession && (
           <div className="ml-1 flex h-full items-center border-l border-white/10 pl-1">
             <button className="grid h-8 w-8 place-items-center rounded-md text-white/60 hover:bg-white/10" onClick={() => bridge.window.minimize()} aria-label="Minimize shell">
               <Minus size={14} />

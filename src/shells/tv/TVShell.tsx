@@ -5,41 +5,61 @@
 import { useMemo, useState } from 'react';
 import { Settings, Power, Play, Music2 } from 'lucide-react';
 import { useOS } from '../../store/useOS';
-import { APPS, TV_ROWS, getApp } from '../../apps/manifest';
+import { APPS, TV_ROWS } from '../../apps/manifest';
+import { launch, LaunchableIcon, useLaunchables, useRunningGroups, focusWindow, type Launchable } from '../../session/launcher';
 import { useAudio, TRACKS } from '../../lib/audioEngine';
 import { useWeather } from '../../lib/weather';
 import { cx, useClock, useTimeFormat } from '../../lib/hooks';
-import type { AppDefinition } from '../../types';
+
+/** Accent colour for any launchable (OPOS apps have one; native apps get a stable hashed hue). */
+function accentOf(l: Launchable) {
+  if (l.opos) return l.opos.accent;
+  const hue = [...l.name].reduce((h, c) => (h * 31 + c.charCodeAt(0)) % 360, 11);
+  return `hsl(${hue} 70% 55%)`;
+}
 
 export function TVShell() {
-  const processes = useOS((s) => s.processes);
   const userName = useOS((s) => s.settings.userName);
-  const launch = useOS((s) => s.launch);
-  const [heroId, setHeroId] = useState('cinema');
-  const hero = getApp(heroId)!;
+  const items = useLaunchables();
+  const running = useRunningGroups();
+  const [heroKey, setHeroKey] = useState('cinema');
+  const hero = items.find((i) => i.key === heroKey) ?? items[0];
+  const heroAccent = accentOf(hero);
   const now = useClock(1000);
   const fmt = useTimeFormat();
   const weather = useWeather();
   const { playing, index } = useAudio();
 
   const rows = useMemo(() => {
-    const running = [...new Set(processes.map((p) => p.appId))].map((id) => getApp(id)!).filter((a) => a.launch !== 'overlay');
+    const byKey = (k: string) => items.find((i) => i.key === k);
+    const continueRow = running.map((g) => g.item).filter(Boolean) as Launchable[];
+    const natives = items.filter((i) => i.kind === 'native');
+    const nativeMedia = natives.filter((i) => i.category === 'games' || i.category === 'media');
+    const nativeOther = natives.filter((i) => !nativeMedia.includes(i));
     return [
-      ...(running.length ? [{ id: 'continue', title: 'Continue', apps: running }] : []),
-      ...TV_ROWS.map((r) => ({ id: r.id, title: r.title, apps: APPS.filter((a) => a.tvRow === r.id) })),
-      { id: 'mobile', title: 'Apps from your phone', apps: APPS.filter((a) => a.category === 'mobile') },
-      { id: 'desktop', title: 'Productivity', apps: APPS.filter((a) => a.category === 'desktop') },
+      ...(continueRow.length ? [{ id: 'continue', title: 'Continue', apps: continueRow }] : []),
+      ...TV_ROWS.map((r) => ({ id: r.id, title: r.title, apps: APPS.filter((a) => a.tvRow === r.id).map((a) => byKey(a.id)!) })),
+      ...(nativeMedia.length ? [{ id: 'native-media', title: 'Games & Media', apps: nativeMedia }] : []),
+      ...(nativeOther.length ? [{ id: 'native', title: 'Installed apps', apps: nativeOther }] : []),
+      { id: 'mobile', title: 'Apps from your phone', apps: APPS.filter((a) => a.category === 'mobile').map((a) => byKey(a.id)!) },
+      { id: 'desktop', title: 'Productivity', apps: APPS.filter((a) => a.category === 'desktop').map((a) => byKey(a.id)!) },
     ];
-  }, [processes]);
+  }, [items, running]);
 
-  const isRunning = processes.some((p) => p.appId === heroId);
+  const runningGroup = running.find((g) => g.key === hero.key);
+  const isRunning = !!runningGroup;
+  const open = (l: Launchable) => {
+    const g = running.find((x) => x.key === l.key);
+    if (g?.windows[0]) focusWindow(g.windows[0].id);
+    else launch(l);
+  };
 
   return (
     <div className="absolute inset-0 overflow-hidden bg-black text-white" data-nav-scope data-nav-priority="0">
       {/* Cinematic backdrop */}
-      <div className="absolute inset-0 transition-[background] duration-700" style={{ background: `radial-gradient(ellipse at 75% 20%, ${hero.accent}55 0%, transparent 55%), radial-gradient(ellipse at 100% 100%, ${hero.accent}22 0%, transparent 50%), #050507` }} />
-      <div className="pointer-events-none absolute right-[6%] top-[8%] opacity-25 blur-[2px] transition-all duration-700" key={hero.id}>
-        <hero.icon size={460} strokeWidth={0.6} style={{ color: hero.accent }} className="animate-fade-in" />
+      <div className="absolute inset-0 transition-[background] duration-700" style={{ background: `radial-gradient(ellipse at 75% 20%, color-mix(in srgb, ${heroAccent} 33%, transparent) 0%, transparent 55%), radial-gradient(ellipse at 100% 100%, color-mix(in srgb, ${heroAccent} 13%, transparent) 0%, transparent 50%), #050507` }} />
+      <div className="pointer-events-none absolute right-[6%] top-[8%] animate-fade-in opacity-25 blur-[2px] transition-all duration-700" key={hero.key}>
+        {hero.opos ? <hero.opos.icon size={460} strokeWidth={0.6} style={{ color: heroAccent }} /> : <LaunchableIcon item={hero} size={380} />}
       </div>
       <div className="absolute inset-0 bg-gradient-to-r from-black via-black/70 to-transparent" />
       <div className="absolute inset-x-0 bottom-0 h-2/3 bg-gradient-to-t from-black via-black/80 to-transparent" />
@@ -71,9 +91,9 @@ export function TVShell() {
       </div>
 
       {/* Hero */}
-      <div className="relative z-10 px-16 pt-[4vh]" key={`hero-${hero.id}`}>
-        <div className="mb-3 animate-fade-in text-lg font-semibold uppercase tracking-[0.3em]" style={{ color: hero.accent }}>
-          {hero.category === 'tv' ? 'Featured' : hero.category === 'system' ? 'System' : 'App'}
+      <div className="relative z-10 px-16 pt-[4vh]" key={`hero-${hero.key}`}>
+        <div className="mb-3 animate-fade-in text-lg font-semibold uppercase tracking-[0.3em]" style={{ color: heroAccent }}>
+          {hero.kind === 'native' ? 'Installed app' : hero.category === 'tv' ? 'Featured' : hero.category === 'system' ? 'System' : 'App'}
           {isRunning && <span className="ml-4 rounded-full bg-white/15 px-3 py-1 text-sm tracking-widest text-white">RUNNING</span>}
         </div>
         <h1 className="max-w-[60vw] animate-slide-up text-[clamp(3rem,6.5vw,7rem)] font-black leading-[0.95] tracking-tight [text-shadow:0_8px_40px_rgba(0,0,0,.6)]">{hero.name}</h1>
@@ -93,7 +113,7 @@ export function TVShell() {
             <h2 className="px-16 text-2xl font-bold text-white/90">{row.title}</h2>
             <div className="no-scrollbar flex gap-8 overflow-x-auto px-16 py-7" data-nav-group={row.id}>
               {row.apps.map((app, i) => (
-                <Tile key={app.id} app={app} autoFocus={ri === 0 && i === 0} onFocus={() => setHeroId(app.id)} onOpen={() => launch(app.id)} />
+                <Tile key={app.key} app={app} autoFocus={ri === 0 && i === 0} onFocus={() => setHeroKey(app.key)} onOpen={() => open(app)} />
               ))}
             </div>
           </section>
@@ -121,7 +141,8 @@ function Hint({ k, children }: { k: string; children: React.ReactNode }) {
   );
 }
 
-function Tile({ app, onFocus, onOpen, autoFocus }: { app: AppDefinition; onFocus: () => void; onOpen: () => void; autoFocus?: boolean }) {
+function Tile({ app, onFocus, onOpen, autoFocus }: { app: Launchable; onFocus: () => void; onOpen: () => void; autoFocus?: boolean }) {
+  const accent = accentOf(app);
   return (
     <button
       data-focusable="tile"
@@ -129,12 +150,14 @@ function Tile({ app, onFocus, onOpen, autoFocus }: { app: AppDefinition; onFocus
       onFocus={onFocus}
       onClick={onOpen}
       className={cx('group relative flex h-[clamp(9rem,13vw,13.5rem)] w-[clamp(16rem,23vw,24rem)] shrink-0 flex-col justify-end overflow-hidden rounded-3xl p-6 text-left')}
-      style={{ background: `linear-gradient(145deg, ${app.accent}cc 0%, #15151c 75%)` }}
+      style={{ background: `linear-gradient(145deg, color-mix(in srgb, ${accent} 80%, transparent) 0%, #15151c 75%)` }}
     >
       <div className="absolute inset-0 bg-[radial-gradient(circle_at_80%_10%,rgba(255,255,255,.22),transparent_45%)]" />
-      <app.icon className="absolute right-5 top-5 text-white/90 drop-shadow-xl" size={64} strokeWidth={1.5} />
+      <div className="absolute right-5 top-5 drop-shadow-xl">
+        {app.opos ? <app.opos.icon className="text-white/90" size={64} strokeWidth={1.5} /> : <LaunchableIcon item={app} size={68} />}
+      </div>
       <div className="relative text-[clamp(1.25rem,1.6vw,1.9rem)] font-extrabold leading-tight text-white drop-shadow">{app.name}</div>
-      <div className="relative mt-1 line-clamp-1 text-base text-white/70">{app.description}</div>
+      <div className="relative mt-1 line-clamp-1 text-base text-white/70">{app.description || (app.kind === 'native' ? 'Installed application' : '')}</div>
     </button>
   );
 }

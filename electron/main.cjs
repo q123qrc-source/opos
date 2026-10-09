@@ -16,6 +16,8 @@ const {
   session,
   shell,
   screen,
+  protocol,
+  net,
 } = require('electron');
 const path = require('path');
 const fs = require('fs');
@@ -23,6 +25,26 @@ const os = require('os');
 const { pathToFileURL } = require('url');
 
 const isDev = !!process.env.VITE_DEV_SERVER_URL;
+/** Session mode: OPOS is the desktop session (on KWin/Wayland) rather than an app window. */
+const IS_SESSION = process.argv.includes('--session') || process.env.OPOS_SESSION === '1';
+const { AppCatalog, iconRoots } = require('./session/apps.cjs');
+const { SystemServices } = require('./session/system.cjs');
+const ipc = require('./session/ipc.cjs');
+
+if (IS_SESSION && process.env.WAYLAND_DISPLAY) app.commandLine.appendSwitch('ozone-platform-hint', 'auto');
+protocol.registerSchemesAsPrivileged([{ scheme: 'opos-icon', privileges: { standard: true, secure: true, supportFetchAPI: true, corsEnabled: true } }]);
+
+/** Load the renderer into a window, passing surface/app parameters as query string. */
+function loadRenderer(win, query = {}) {
+  const q = Object.fromEntries(Object.entries(query).filter(([, v]) => v !== undefined));
+  if (isDev) {
+    const url = new URL(process.env.VITE_DEV_SERVER_URL);
+    for (const [k, v] of Object.entries(q)) url.searchParams.set(k, v);
+    win.loadURL(url.toString());
+  } else {
+    win.loadFile(path.join(__dirname, '..', 'dist', 'index.html'), { query: q });
+  }
+}
 const SHIM_PATH = path.join(__dirname, 'webview-shim.cjs');
 const APP_PARTITION = 'persist:opos-apps';
 
@@ -188,20 +210,6 @@ function createWindow() {
     mainWindow = null;
   });
 
-  // Every <webview> is forced through the compatibility shim with DRM-capable preferences,
-  // regardless of what the renderer asked for.
-  mainWindow.webContents.on('will-attach-webview', (_event, webPreferences, params) => {
-    delete webPreferences.preloadURL;
-    webPreferences.preload = SHIM_PATH;
-    webPreferences.plugins = true;
-    webPreferences.contextIsolation = true;
-    webPreferences.nodeIntegration = false;
-    webPreferences.nodeIntegrationInSubFrames = false;
-    webPreferences.sandbox = false; // shim needs ipcRenderer.sendToHost + contextBridge
-    webPreferences.webSecurity = true;
-    if (!/^(https?|file|about|data):/i.test(params.src || 'about:blank')) params.src = 'about:blank';
-  });
-
   // Media keys arriving while the shell itself is focused (also covered by globalShortcut).
   mainWindow.webContents.on('before-input-event', (event, input) => {
     if (input.type !== 'keyDown') return;
@@ -212,11 +220,7 @@ function createWindow() {
     }
   });
 
-  if (isDev) {
-    mainWindow.loadURL(process.env.VITE_DEV_SERVER_URL);
-  } else {
-    mainWindow.loadFile(path.join(__dirname, '..', 'dist', 'index.html'));
-  }
+  loadRenderer(mainWindow);
 }
 
 function mediaActionForKey(key) {
@@ -240,8 +244,26 @@ function mediaActionForKey(key) {
 /* 4. Guest (webview) contents                                                 */
 /* -------------------------------------------------------------------------- */
 
+/** Every <webview> is forced through the compatibility shim with DRM-capable preferences. */
+function hardenWebviews(contents) {
+  contents.on('will-attach-webview', (_event, webPreferences, params) => {
+    delete webPreferences.preloadURL;
+    webPreferences.preload = SHIM_PATH;
+    webPreferences.plugins = true;
+    webPreferences.contextIsolation = true;
+    webPreferences.nodeIntegration = false;
+    webPreferences.nodeIntegrationInSubFrames = false;
+    webPreferences.sandbox = false; // shim needs ipcRenderer.sendToHost + contextBridge
+    webPreferences.webSecurity = true;
+    if (!/^(https?|file|about|data):/i.test(params.src || 'about:blank')) params.src = 'about:blank';
+  });
+}
+
 app.on('web-contents-created', (_e, contents) => {
-  if (contents.getType() !== 'webview') return;
+  if (contents.getType() !== 'webview') {
+    hardenWebviews(contents);
+    return;
+  }
 
   // Popups (OAuth, target=_blank) open inside the same container instead of new OS windows.
   contents.setWindowOpenHandler(({ url }) => {
@@ -387,10 +409,41 @@ function registerMediaKeys() {
 /* 7. Lifecycle                                                                */
 /* -------------------------------------------------------------------------- */
 
+let sessionManager = null;
+
+/** opos-icon://icon/<absolute path> — serves themed app icons, restricted to icon directories. */
+function registerIconProtocol() {
+  const roots = iconRoots();
+  protocol.handle('opos-icon', (request) => {
+    const file = decodeURI(new URL(request.url).pathname);
+    const ok = /\.(png|svg)$/i.test(file) && roots.some((r) => file.startsWith(r + path.sep));
+    if (!ok) return new Response('forbidden', { status: 403 });
+    return net.fetch(pathToFileURL(file).toString());
+  });
+}
+
 app.whenReady().then(async () => {
   await initWidevine();
   hardenSession(session.defaultSession);
   hardenSession(session.fromPartition(APP_PARTITION));
+  registerIconProtocol();
+
+  const catalog = new AppCatalog();
+  catalog.scan();
+  catalog.watch();
+  const system = new SystemServices();
+  ipc.register({ system, catalog, getSession: () => sessionManager });
+
+  if (IS_SESSION) {
+    const { SessionManager } = require('./session/session.cjs');
+    sessionManager = new SessionManager({ loadRenderer, preload: path.join(__dirname, 'preload.cjs'), catalog, system });
+    ipc.wireStateBroadcast(sessionManager);
+    system.start().catch((e) => console.warn('[OPOS] system services:', e.message));
+    await sessionManager.start();
+    return;
+  }
+
+  system.start().catch(() => {});
   buildMenu();
   createWindow();
   registerMediaKeys();
@@ -402,6 +455,7 @@ app.whenReady().then(async () => {
 
 app.on('will-quit', () => globalShortcut.unregisterAll());
 app.on('window-all-closed', () => {
+  if (IS_SESSION) return; // shell surfaces own the session lifetime
   if (process.platform !== 'darwin') app.quit();
 });
 
